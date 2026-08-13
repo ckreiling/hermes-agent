@@ -433,7 +433,15 @@ class SessionManager:
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
-        provider = getattr(state.agent, "provider", None)
+        # Persist the *named* provider identity (e.g. "custom:exe-llm"), not
+        # the normalized runtime provider ("custom"). _restore feeds this back
+        # into resolve_runtime_provider(requested=...), and only the named form
+        # can locate a named custom_providers entry (and its API key) again —
+        # bare "custom" falls through to the generic env/config path, loses the
+        # credential, and makes AIAgent.__init__ raise on every restore.
+        provider = getattr(state.agent, "requested_provider", None)
+        if not (isinstance(provider, str) and provider.strip()):
+            provider = getattr(state.agent, "provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
@@ -452,7 +460,7 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=session_meta,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -569,8 +577,42 @@ class SessionManager:
                 api_mode=restored_api_mode,
             )
         except Exception:
-            logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
-            return None
+            # The persisted provider metadata could not reconstruct an agent
+            # (e.g. legacy rows that stored the normalized "custom" provider
+            # without a resolvable credential, or a provider that has since
+            # been renamed/removed from config.yaml). The conversation history
+            # is the valuable artifact — retry once with the current config
+            # defaults rather than losing the session.
+            had_overrides = bool(requested_provider or restored_base_url or restored_api_mode)
+            if not had_overrides:
+                logger.warning(
+                    "Failed to recreate agent for ACP session %s", session_id, exc_info=True
+                )
+                return None
+            logger.warning(
+                "Failed to recreate agent for ACP session %s with persisted "
+                "provider metadata (provider=%r, base_url=%r, api_mode=%r); "
+                "retrying with current config defaults — the session may "
+                "continue on a different provider/model than it started with",
+                session_id,
+                requested_provider,
+                restored_base_url,
+                restored_api_mode,
+                exc_info=True,
+            )
+            try:
+                agent = self._make_agent(
+                    session_id=session_id,
+                    cwd=cwd,
+                    model=model,
+                )
+            except Exception:
+                logger.warning(
+                    "Fallback agent recreation also failed for ACP session %s",
+                    session_id,
+                    exc_info=True,
+                )
+                return None
 
         state = SessionState(
             session_id=session_id,
@@ -649,6 +691,13 @@ class SessionManager:
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
+                    # Keep the pre-normalization provider identity (e.g.
+                    # "custom:exe-llm") on the agent so _persist can round-trip
+                    # it; the normalized "provider" alone cannot resolve a
+                    # named custom provider's credentials on restore.
+                    "requested_provider": runtime.get("requested_provider")
+                    or requested_provider
+                    or config_provider,
                     "api_mode": api_mode or runtime.get("api_mode"),
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),

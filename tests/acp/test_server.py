@@ -403,11 +403,16 @@ class TestSessionConfiguration:
 
 class TestPrompt:
     @pytest.mark.asyncio
-    async def test_prompt_returns_refusal_for_unknown_session(self, agent):
+    async def test_prompt_raises_jsonrpc_error_for_unknown_session(self, agent):
+        """A missing/unrestorable session is a protocol error, not a model
+        refusal — stop_reason='refusal' made clients render an opaque
+        "Agent stopped the turn: refusal"."""
         prompt = [TextContentBlock(type="text", text="hello")]
-        resp = await agent.prompt(prompt=prompt, session_id="nonexistent")
-        assert isinstance(resp, PromptResponse)
-        assert resp.stop_reason == "refusal"
+        with pytest.raises(acp.RequestError) as excinfo:
+            await agent.prompt(prompt=prompt, session_id="nonexistent")
+        assert excinfo.value.code == -32002
+        assert excinfo.value.data == {"sessionId": "nonexistent"}
+        assert "not found" in str(excinfo.value).lower()
 
     @pytest.mark.asyncio
     async def test_prompt_binds_session_id_into_subprocess_env(self, agent, mock_manager):

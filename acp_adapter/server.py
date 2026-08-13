@@ -1796,8 +1796,19 @@ class HermesACPAgent(acp.Agent):
         """Run Hermes on the user's prompt and stream events back to the editor."""
         state = self.session_manager.get_session(session_id)
         if state is None:
+            # Per ACP semantics, ``stop_reason="refusal"`` means *the model
+            # refused to continue* — returning it for a missing/unrestorable
+            # session made clients render an opaque "Agent stopped the turn:
+            # refusal" instead of surfacing the real failure. A session that
+            # cannot be found (or restored from state.db) is a protocol-level
+            # error, so report it as a JSON-RPC error like session/load does.
             logger.error("prompt: session %s not found", session_id)
-            return PromptResponse(stop_reason="refusal")
+            raise acp.RequestError(
+                -32002,
+                "Session not found: it does not exist or could not be "
+                "restored from persistent storage (see agent logs)",
+                {"sessionId": session_id},
+            )
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)

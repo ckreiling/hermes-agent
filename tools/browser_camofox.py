@@ -31,7 +31,7 @@ import logging
 import os
 import threading
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
@@ -859,7 +859,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 
 
 def camofox_vision(question: str, annotate: bool = False,
-                   task_id: Optional[str] = None) -> str:
+                   task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
     """Take a screenshot and analyze it with vision AI via Camofox."""
     try:
         session = _get_session(task_id)
@@ -905,6 +905,32 @@ def camofox_vision(question: str, annotate: bool = False,
         # text-based accessibility tree snippet won't leak secret values.
         from agent.redact import redact_sensitive_text
         annotation_context = redact_sensitive_text(annotation_context)
+
+        # Match browser_tool.browser_vision: when the active main model can
+        # consume images in tool results, attach the screenshot directly and
+        # skip the redundant auxiliary vision LLM call.
+        from tools.vision_tools import (
+            _build_native_vision_tool_result,
+            _should_use_native_vision_fast_path,
+        )
+
+        if _should_use_native_vision_fast_path():
+            native_result = _build_native_vision_tool_result(
+                image_url=screenshot_path,
+                question=question,
+                image_data_url=f"data:image/png;base64,{img_b64}",
+                image_size_bytes=len(resp.content),
+            )
+            if annotation_context:
+                content = native_result.get("content") or []
+                if content and content[0].get("type") == "text":
+                    content[0]["text"] += annotation_context
+            native_result.setdefault("meta", {})["screenshot_path"] = screenshot_path
+            native_result["text_summary"] = (
+                f"{native_result.get('text_summary', '')} "
+                f"Screenshot path: {screenshot_path}"
+            ).strip()
+            return native_result
 
         # Send to vision LLM
         from agent.auxiliary_client import call_llm

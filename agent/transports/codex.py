@@ -850,14 +850,17 @@ class ResponsesApiTransport(ProviderTransport):
         else:
             kwargs.pop("timeout", None)
 
-        if is_codex_backend:
-            # The Codex backend rejects body-level ``extra_headers`` with
-            # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
-            # to actual HTTP request headers (not body fields).  ``session_id``
-            # carries the raw physical session id — transcript/identity, per
-            # the #57012 contract — while ``x-client-request-id`` mirrors the
-            # body's effective ``prompt_cache_key`` so header and body always
-            # agree on the same routing bucket instead of diverging (#78941).
+        if is_codex_backend or not (is_github_responses or is_xai_responses):
+            # Session-affinity headers for Codex and generic OpenAI-compatible
+            # Responses endpoints. The OpenAI SDK's ``extra_headers`` kwarg maps
+            # to actual HTTP request headers (not body fields). Our custom
+            # Responses gateway uses these values to keep one conversation on
+            # the cache worker holding its warm prefix; api.openai.com safely
+            # ignores the unknown headers. ``session_id`` carries the raw
+            # physical session id, while ``x-client-request-id`` mirrors the
+            # body's effective ``prompt_cache_key`` so header and body agree on
+            # the same routing bucket. GitHub opts out; xAI uses
+            # ``x-grok-conv-id`` below.
             final_cache_key = kwargs.get("prompt_cache_key") or _bounded_prompt_cache_key(_cache_scope)
             if session_id or final_cache_key:
                 existing_extra_headers = kwargs.get("extra_headers")

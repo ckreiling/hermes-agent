@@ -106,6 +106,48 @@ class TestCodexBuildKwargs:
         )
         assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
 
+    def test_generic_responses_endpoint_gets_session_affinity_headers(self, transport):
+        """Generic OpenAI-compatible Responses gateways get stable affinity."""
+        kw = transport.build_kwargs(
+            model="openai/gpt-5.6-terra",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="sess-generic-1",
+            base_url="https://llm.example.com/v1",
+        )
+        headers = kw.get("extra_headers", {})
+        assert headers["session_id"] == "sess-generic-1"
+        assert headers["x-client-request-id"] == kw["prompt_cache_key"]
+        assert headers["x-client-request-id"].startswith("pck_")
+
+    def test_generic_responses_endpoint_without_session_uses_content_affinity_only(self, transport):
+        """Without a session, preserve v0.20's bounded prefix-routing hint."""
+        kw = transport.build_kwargs(
+            model="openai/gpt-5.6-terra",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url="https://llm.example.com/v1",
+        )
+        headers = kw["extra_headers"]
+        assert "session_id" not in headers
+        assert headers["x-client-request-id"] == kw["prompt_cache_key"]
+        assert headers["x-client-request-id"].startswith("pck_")
+
+    @pytest.mark.parametrize("flag", ["is_github_responses", "is_xai_responses"])
+    def test_non_openai_responses_backends_skip_generic_affinity_headers(
+        self, transport, flag
+    ):
+        kw = transport.build_kwargs(
+            model="gpt-5.4" if flag == "is_github_responses" else "grok-4.3",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="sess-skip-1",
+            **{flag: True},
+        )
+        headers = kw.get("extra_headers", {})
+        assert "session_id" not in headers
+        assert "x-client-request-id" not in headers
+
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):
         # #32716: Copilot binds codex_message_items ids to a backend
         # "connection" that doesn't survive credential rotation, a gateway

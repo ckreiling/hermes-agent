@@ -275,6 +275,47 @@ class TestCamofoxVisionConfig:
     @patch("tools.browser_camofox.requests.post")
     @patch("tools.browser_camofox._get")
     @patch("tools.browser_camofox._get_raw")
+    def test_camofox_vision_uses_native_fast_path(
+        self, mock_get_raw, mock_get, mock_post, monkeypatch
+    ):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        mock_post.return_value = _mock_response(
+            json_data={"tabId": "tab_native", "url": "https://x.com"}
+        )
+        camofox_navigate("https://x.com", task_id="t_native")
+
+        raw_resp = MagicMock()
+        raw_resp.content = b"fakepng"
+        mock_get_raw.return_value = raw_resp
+        mock_get.return_value = {"snapshot": '- button "Submit" [e1]\n'}
+
+        with (
+            patch("tools.browser_camofox.open", create=True),
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=True,
+            ),
+            patch("agent.auxiliary_client.call_llm") as mock_llm,
+        ):
+            result = camofox_vision(
+                "what is on the page?", annotate=True, task_id="t_native"
+            )
+
+        assert isinstance(result, dict)
+        assert result["_multimodal"] is True
+        assert result["meta"]["screenshot_path"].endswith(".png")
+        assert result["meta"]["screenshot_path"] in result["text_summary"]
+        text_part = next(part for part in result["content"] if part["type"] == "text")
+        image_part = next(
+            part for part in result["content"] if part["type"] == "image_url"
+        )
+        assert 'button "Submit" [e1]' in text_part["text"]
+        assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
+        mock_llm.assert_not_called()
+
+    @patch("tools.browser_camofox.requests.post")
+    @patch("tools.browser_camofox._get")
+    @patch("tools.browser_camofox._get_raw")
     def test_camofox_vision_uses_configured_temperature_and_timeout(self, mock_get_raw, mock_get, mock_post, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         mock_post.return_value = _mock_response(json_data={"tabId": "tab11", "url": "https://x.com"})
@@ -293,6 +334,10 @@ class TestCamofoxVisionConfig:
 
         with (
             patch("tools.browser_camofox.open", create=True) as mock_open,
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=False,
+            ),
             patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_llm,
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
         ):
@@ -325,6 +370,10 @@ class TestCamofoxVisionConfig:
 
         with (
             patch("tools.browser_camofox.open", create=True) as mock_open,
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=False,
+            ),
             patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_llm,
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {}}}),
         ):

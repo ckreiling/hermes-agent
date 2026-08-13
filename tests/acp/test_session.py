@@ -378,3 +378,161 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# persist/restore provider round-trip — regression for the un-restorable
+# persisted-session bug: _persist stored the *normalized* provider ("custom")
+# instead of the named provider ("custom:exe-llm"), so _restore could never
+# resolve the named custom provider's API key again and every restore raised
+# "No LLM provider configured".
+# ---------------------------------------------------------------------------
+
+
+NAMED_PROVIDER = "custom:exe-llm"
+
+
+def _fake_resolve_runtime_provider(requested=None, **kwargs):
+    """Only the *named* provider resolves credentials, mirroring production."""
+    if requested == NAMED_PROVIDER:
+        return {
+            "provider": "custom",
+            "requested_provider": NAMED_PROVIDER,
+            "api_mode": "codex_responses",
+            "base_url": "https://llm.example/v1",
+            "api_key": "named-key",
+            "command": None,
+            "args": [],
+        }
+    # Bare "custom" / unknown providers fall through to the generic
+    # env/config path: no API key.
+    return {
+        "provider": "custom",
+        "requested_provider": requested or "custom",
+        "api_mode": "chat_completions",
+        "base_url": "https://openrouter.example/v1",
+        "api_key": None,
+        "command": None,
+        "args": [],
+    }
+
+
+class _FakeAIAgent:
+    """Mimics AIAgent's provider attributes + its no-credential failure."""
+
+    def __init__(self, **kwargs):
+        if not kwargs.get("api_key"):
+            raise RuntimeError(
+                "No LLM provider configured. Run `hermes model` ..."
+            )
+        self.kwargs = kwargs
+        self.model = kwargs.get("model") or ""
+        self.provider = kwargs.get("provider") or ""
+        self.requested_provider = kwargs.get("requested_provider") or self.provider
+        self.base_url = kwargs.get("base_url") or ""
+        self.api_mode = kwargs.get("api_mode") or ""
+        self._print_fn = None
+
+
+@pytest.fixture()
+def provider_env(tmp_path, monkeypatch):
+    """Real _make_agent path (no agent_factory) with a named custom provider."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {"default": "test-model", "provider": NAMED_PROVIDER},
+            "mcp_servers": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _fake_resolve_runtime_provider,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **kwargs: None,
+    )
+    db = SessionDB(tmp_path / "state.db")
+    with patch("run_agent.AIAgent", _FakeAIAgent):
+        yield SessionManager(db=db)
+
+
+class TestProviderRoundTrip:
+    def test_persist_stores_named_provider_not_normalized(self, provider_env):
+        manager = provider_env
+        state = manager.create_session(cwd="/work")
+
+        row = manager._get_db().get_session(state.session_id)
+        meta = json.loads(row["model_config"])
+        assert meta["provider"] == NAMED_PROVIDER
+
+    def test_restored_session_resolves_named_provider_credentials(self, provider_env):
+        manager = provider_env
+        state = manager.create_session(cwd="/work")
+        state.history.append({"role": "user", "content": "hello"})
+        manager.save_session(state.session_id)
+        session_id = state.session_id
+
+        # Simulate a process restart: drop the in-memory session.
+        with manager._lock:
+            manager._sessions.clear()
+
+        restored = manager.get_session(session_id)
+        assert restored is not None
+        assert restored.agent.kwargs["api_key"] == "named-key"
+        assert restored.agent.requested_provider == NAMED_PROVIDER
+        assert [m["content"] for m in restored.history] == ["hello"]
+
+    def test_restore_falls_back_to_config_defaults_for_legacy_rows(self, provider_env):
+        """Rows persisted before the fix carry provider='custom' (normalized).
+
+        The first _make_agent attempt with that metadata fails (no credential
+        resolvable); _restore must retry with current config defaults instead
+        of returning None, because the conversation history is the valuable
+        artifact.
+        """
+        manager = provider_env
+        db = manager._get_db()
+        db.create_session(
+            session_id="legacy-acp-session",
+            source="acp",
+            model="test-model",
+            model_config={
+                "cwd": "/work",
+                "provider": "custom",  # normalized — cannot resolve a key
+                "base_url": "https://openrouter.example/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        db.replace_messages(
+            "legacy-acp-session", [{"role": "user", "content": "old history"}]
+        )
+
+        restored = manager.get_session("legacy-acp-session")
+        assert restored is not None
+        # Fallback path: config defaults (named provider) resolved the key.
+        assert restored.agent.kwargs["api_key"] == "named-key"
+        assert [m["content"] for m in restored.history] == ["old history"]
+
+    def test_restore_returns_none_when_fallback_also_fails(self, provider_env, monkeypatch):
+        manager = provider_env
+        db = manager._get_db()
+        db.create_session(
+            session_id="doomed-acp-session",
+            source="acp",
+            model="test-model",
+            model_config={"cwd": "/work", "provider": "custom"},
+        )
+        # Now even the config default cannot resolve credentials.
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **kwargs: {
+                "provider": "custom",
+                "api_key": None,
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.example/v1",
+                "command": None,
+                "args": [],
+            },
+        )
+        assert manager.get_session("doomed-acp-session") is None
