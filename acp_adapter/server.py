@@ -2169,7 +2169,14 @@ class HermesACPAgent(acp.Agent):
                     exc_info=True,
                 )
 
-        final_response = result.get("final_response", "")
+        raw_final_response = result.get("final_response")
+        # Interrupted tool turns legitimately return ``None`` here while the
+        # turn finalizer appends an "Operation interrupted." placeholder to the
+        # durable transcript. Keep ACP post-processing string-safe so cleanup
+        # below always releases the session instead of wedging it as running.
+        final_response = (
+            raw_final_response if isinstance(raw_final_response, str) else ""
+        )
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
         # Hermes' local "waiting for model response" interrupt status is metadata,
