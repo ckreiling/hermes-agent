@@ -458,6 +458,46 @@ def provider_env(tmp_path, monkeypatch):
 
 
 class TestProviderRoundTrip:
+    def test_real_config_resolution_round_trips_named_provider(self, tmp_path, monkeypatch):
+        """Exercise config.yaml -> resolver -> ACP persistence -> resolver."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            """\
+model:
+  default: test-model
+  provider: custom:exe-llm
+custom_providers:
+  - name: exe-llm
+    base_url: https://llm.example/v1
+    api_key: named-key
+    api_mode: codex_responses
+""",
+            encoding="utf-8",
+        )
+        from hermes_cli.config import load_config
+
+        # An earlier test imports runtime_provider while config.load_config is
+        # monkeypatched; restore the real loader that the resolver imported.
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", load_config)
+        monkeypatch.setattr(
+            "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+            lambda **kwargs: None,
+        )
+        manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
+
+        with patch("run_agent.AIAgent", _FakeAIAgent):
+            state = manager.create_session(cwd="/work")
+            state.history.append({"role": "user", "content": "hello"})
+            manager.save_session(state.session_id)
+            with manager._lock:
+                manager._sessions.clear()
+            restored = manager.get_session(state.session_id)
+
+        assert restored is not None
+        assert restored.agent.kwargs["api_key"] == "named-key"
+        assert restored.agent.requested_provider == NAMED_PROVIDER
+        assert [message["content"] for message in restored.history] == ["hello"]
+
     def test_persist_stores_named_provider_not_normalized(self, provider_env):
         manager = provider_env
         state = manager.create_session(cwd="/work")
