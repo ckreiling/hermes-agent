@@ -211,6 +211,17 @@ def _json_loads_maybe(value: Optional[str]) -> Any:
         return None
 
 
+def _file_edit_result_landed(tool_name: str, data: Any) -> bool:
+    """Return whether structured ACP edit output confirms execution landed."""
+    if not isinstance(data, dict) or data.get("error"):
+        return False
+    if tool_name == "write_file":
+        return "bytes_written" in data
+    if tool_name == "patch":
+        return data.get("success") is True
+    return False
+
+
 def _tool_result_failed(result: Optional[str], tool_name: str | None = None) -> bool:
     """Return True when a structured Hermes tool result clearly failed.
 
@@ -226,6 +237,12 @@ def _tool_result_failed(result: Optional[str], tool_name: str | None = None) -> 
     # failed in Zed instead of misleadingly green.
     if isinstance(result, str) and result.startswith("Error executing tool '"):
         return True
+
+    if tool_name in {"write_file", "patch"}:
+        data = _json_loads_maybe(result)
+        if isinstance(data, dict) and data.get("no_change") is True and data.get("success") is True:
+            return False
+        return not _file_edit_result_landed(tool_name, data)
 
     data = _json_loads_maybe(result)
     if not isinstance(data, dict):
@@ -711,6 +728,22 @@ def _format_edit_result(tool_name: str, result: Optional[str], args: Optional[Di
     if isinstance(data, dict):
         if data.get("success") is False or data.get("error"):
             return f"{tool_name} failed for {path}: {data.get('error', 'unknown error')}"
+        if data.get("no_change") is True:
+            note = str(data.get("note") or data.get("message") or "No file changes were made.").strip()
+            return f"{tool_name} made no changes" + (f" to `{path}`" if path else "") + f"\n{note}"
+
+        landed = _file_edit_result_landed(tool_name, data)
+        if not landed:
+            message = str(data.get("message") or "").strip()
+            lines = [
+                f"{tool_name} returned without confirming a file mutation"
+                + (f" for `{path}`" if path else ""),
+                "No completion diff was emitted.",
+            ]
+            if message:
+                lines.append(message)
+            return "\n".join(lines)
+
         message = str(data.get("message") or "").strip()
         replacements = data.get("replacements") or data.get("replacement_count")
         lines = [f"✅ {tool_name} completed" + (f" for `{path}`" if path else "")]
@@ -725,7 +758,10 @@ def _format_edit_result(tool_name: str, result: Optional[str], args: Optional[Di
         return "\n".join(lines)
     if isinstance(result, str) and result.strip():
         return _truncate_text(result, limit=3000)
-    return f"✅ {tool_name} completed" + (f" for `{path}`" if path else "")
+    return (
+        f"{tool_name} result unavailable" + (f" for `{path}`" if path else "")
+        + ". No completion diff was emitted."
+    )
 
 
 def _format_browser_result(tool_name: str, result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1025,6 +1061,47 @@ def _build_tool_complete_content(
     display_result = result or ""
     if len(display_result) > 5000:
         display_result = display_result[:4900] + f"\n... ({len(result)} chars total, truncated)"
+
+    if tool_name in {"write_file", "patch"}:
+        polished_content = _build_polished_completion_content(tool_name, result, function_args)
+        if snapshot is None:
+            # Historical ACP replay has no ephemeral before-state. Do not parse
+            # result hunks as whole files or read today's filesystem to invent it.
+            return polished_content or [_text(display_result)]
+        try:
+            from agent.display import collect_local_edit_changes
+
+            changes, skipped = collect_local_edit_changes(tool_name, result, snapshot)
+            content = list(polished_content or [])
+            content.extend(
+                acp.tool_diff_content(
+                    path=change.path,
+                    old_text=change.before.text if change.before.exists else None,
+                    # ACP has no deletion marker. Empty newText is its closest
+                    # faithful representation; keep the explanatory text below.
+                    new_text=change.after.text if change.after.exists else "",
+                )
+                for change in changes
+            )
+            deleted = sum(not change.after.exists for change in changes)
+            notes: list[str] = []
+            if deleted:
+                notes.append(
+                    f"ACP represents {deleted} deleted file{'s' if deleted != 1 else ''} "
+                    "with empty new text because the protocol has no deletion flag."
+                )
+            if skipped:
+                notes.append(
+                    f"Structured diff unavailable for {len(skipped)} file"
+                    f"{'s' if len(skipped) != 1 else ''}: full bounded UTF-8 "
+                    "before/after content could not be captured safely."
+                )
+            if notes:
+                content.append(_text("\n".join(notes)))
+            return content or [_text(display_result)]
+        except Exception:
+            logger.debug("Failed to build ACP completion file diff for %s", tool_name, exc_info=True)
+            return polished_content or [_text(display_result)]
 
     if tool_name == "skill_manage":
         try:

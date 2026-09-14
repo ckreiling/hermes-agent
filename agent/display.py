@@ -4,9 +4,11 @@ Pure display functions and classes with no AIAgent dependency.
 Used by AIAgent._execute_tool_calls for CLI feedback.
 """
 
+import json
 import logging
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -98,13 +100,40 @@ def _diff_minus(): return _diff_ansi()["minus"]
 def _diff_plus():  return _diff_ansi()["plus"]
 _MAX_INLINE_DIFF_FILES = 6
 _MAX_INLINE_DIFF_LINES = 80
+_MAX_LOCAL_EDIT_SNAPSHOT_FILES = 32
+_MAX_LOCAL_EDIT_SNAPSHOT_BYTES = 1_000_000
+_MAX_LOCAL_EDIT_SNAPSHOT_TOTAL_BYTES = 4_000_000
+
+
+@dataclass(frozen=True)
+class LocalFileSnapshot:
+    """A bounded, textual observation of one local file."""
+
+    exists: bool
+    text: str
+
+
+@dataclass(frozen=True)
+class LocalEditChange:
+    """Observed full-file before/after state for an edit completion."""
+
+    path: str
+    before: LocalFileSnapshot
+    after: LocalFileSnapshot
 
 
 @dataclass
 class LocalEditSnapshot:
-    """Pre-tool filesystem snapshot used to render diffs locally after writes."""
+    """Pre-tool filesystem snapshot used to render diffs locally after writes.
+
+    ``before`` only contains files whose complete UTF-8 content was captured.
+    Missing files are represented explicitly so creating an empty file remains
+    distinguishable from a no-op. Large, binary, special, and unreadable files
+    are omitted rather than emitting a partial or guessed diff.
+    """
+
     paths: list[Path] = field(default_factory=list)
-    before: dict[str, str | None] = field(default_factory=dict)
+    before: dict[str, LocalFileSnapshot] = field(default_factory=dict)
 
 # =========================================================================
 # Configurable tool preview length (0 = no limit)
@@ -798,12 +827,48 @@ def _resolved_path(path: str) -> Path:
     return Path.cwd() / candidate
 
 
-def _snapshot_text(path: Path) -> str | None:
-    """Return UTF-8 file content, or None for missing/unreadable files."""
+def _snapshot_file(
+    path: Path,
+    *,
+    max_bytes: int = _MAX_LOCAL_EDIT_SNAPSHOT_BYTES,
+) -> LocalFileSnapshot | None:
+    """Return bounded full UTF-8 state, or ``None`` when unsafe to capture.
+
+    Open with ``O_NONBLOCK`` before checking ``fstat`` so a path swapped to a
+    FIFO/device between lookup and open cannot stall the agent. Symlinks are
+    allowed only when their opened target is a regular file.
+    """
+    capture_limit = min(_MAX_LOCAL_EDIT_SNAPSHOT_BYTES, max(0, max_bytes))
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        return path.read_text(encoding="utf-8")
-    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, OSError):
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return LocalFileSnapshot(exists=False, text="")
+    except (IsADirectoryError, PermissionError, OSError):
         return None
+
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            raw = handle.read(capture_limit + 1)
+    except (IsADirectoryError, PermissionError, OSError):
+        return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if len(raw) > capture_limit or b"\x00" in raw:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return LocalFileSnapshot(exists=True, text=text)
 
 
 def _display_diff_path(path: Path) -> str:
@@ -844,35 +909,166 @@ def _resolve_skill_manage_paths(args: dict) -> list[Path]:
     return []
 
 
-def _resolve_local_edit_paths(tool_name: str, function_args: dict | None) -> list[Path]:
-    """Resolve local filesystem targets for write-capable tools."""
+def _resolve_local_edit_paths(
+    tool_name: str,
+    function_args: dict | None,
+    *,
+    task_id: str | None = None,
+) -> list[Path]:
+    """Resolve local filesystem targets for write-capable tools.
+
+    When a task id is provided, use the same task-scoped resolver as the file
+    tools and refuse non-local terminal backends. Snapshotting never shells out
+    to Docker/SSH or treats a remote path as a host path.
+    """
     if not isinstance(function_args, dict):
         return []
 
+    resolver = _resolved_path
+    if task_id is not None:
+        try:
+            from tools.file_tools import _resolve_path_for_task, _terminal_env_type_for_task
+
+            if _terminal_env_type_for_task(task_id) != "local":
+                return []
+            resolver = lambda value: Path(_resolve_path_for_task(value, task_id))
+        except Exception:
+            return []
+
+    raw_paths: list[str] = []
     if tool_name == "write_file":
         path = function_args.get("path")
-        return [_resolved_path(path)] if path else []
+        if path:
+            raw_paths.append(str(path))
 
-    if tool_name == "patch":
-        path = function_args.get("path")
-        return [_resolved_path(path)] if path else []
+    elif tool_name == "patch":
+        if function_args.get("mode", "replace") == "patch":
+            patch_body = function_args.get("patch")
+            if not isinstance(patch_body, str) or not patch_body:
+                return []
+            try:
+                from tools.patch_parser import parse_v4a_patch
 
-    if tool_name == "skill_manage":
+                operations, error = parse_v4a_patch(patch_body)
+            except Exception:
+                return []
+            if error:
+                return []
+            for operation in operations:
+                raw_paths.append(str(operation.file_path))
+                if operation.new_path:
+                    raw_paths.append(str(operation.new_path))
+        else:
+            path = function_args.get("path")
+            if path:
+                raw_paths.append(str(path))
+
+    elif tool_name == "skill_manage":
         return _resolve_skill_manage_paths(function_args)
 
-    return []
+    if len(raw_paths) > _MAX_LOCAL_EDIT_SNAPSHOT_FILES:
+        return []
+
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        try:
+            path = resolver(raw_path)
+        except Exception:
+            return []
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+    return paths
 
 
-def capture_local_edit_snapshot(tool_name: str, function_args: dict | None) -> LocalEditSnapshot | None:
-    """Capture before-state for local write previews."""
-    paths = _resolve_local_edit_paths(tool_name, function_args)
+def capture_local_edit_snapshot(
+    tool_name: str,
+    function_args: dict | None,
+    *,
+    task_id: str | None = None,
+) -> LocalEditSnapshot | None:
+    """Capture bounded before-state for local write previews.
+
+    The snapshot is intentionally ephemeral. It is safe for live completion
+    events, but is not persisted and therefore cannot reconstruct historical
+    ACP diffs during a later session replay.
+    """
+    paths = _resolve_local_edit_paths(tool_name, function_args, task_id=task_id)
     if not paths:
         return None
 
     snapshot = LocalEditSnapshot(paths=paths)
+    remaining_bytes = _MAX_LOCAL_EDIT_SNAPSHOT_TOTAL_BYTES
     for path in paths:
-        snapshot.before[str(path)] = _snapshot_text(path)
+        state = _snapshot_file(path, max_bytes=remaining_bytes)
+        if state is not None:
+            snapshot.before[str(path)] = state
+            if state.exists:
+                remaining_bytes -= len(state.text.encode("utf-8"))
     return snapshot
+
+
+def _local_edit_result_landed(tool_name: str, result: str | None) -> tuple[bool, dict | None]:
+    """Classify file results, including JSON with an appended Hermes hint."""
+    if not isinstance(result, str) or not result.strip():
+        return False, None
+    data = safe_json_loads(result)
+    if not isinstance(data, dict):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(result.lstrip())
+        except Exception:
+            return False, None
+    if not isinstance(data, dict) or data.get("error"):
+        return False, data if isinstance(data, dict) else None
+    if tool_name == "write_file":
+        return "bytes_written" in data, data
+    if tool_name == "patch":
+        return data.get("success") is True, data
+    return False, data
+
+
+def collect_local_edit_changes(
+    tool_name: str,
+    result: str | None,
+    snapshot: LocalEditSnapshot | None,
+) -> tuple[list[LocalEditChange], list[str]]:
+    """Return faithful full-file changes observed around a successful edit.
+
+    No current-filesystem reconstruction is attempted without a pre-execution
+    snapshot. Failed, missing, and explicit no-op results yield no changes. A
+    path is skipped unless both sides can be read completely as bounded UTF-8.
+    Deletions have an explicit ``after.exists=False`` state; ACP currently has
+    no deletion flag, so callers must represent that as an empty ``newText``.
+    """
+    if not snapshot:
+        return [], []
+    landed, data = _local_edit_result_landed(tool_name, result)
+    if not landed:
+        return [], []
+    if isinstance(data, dict) and data.get("no_change") is True:
+        return [], []
+
+    changes: list[LocalEditChange] = []
+    skipped: list[str] = []
+    remaining_bytes = _MAX_LOCAL_EDIT_SNAPSHOT_TOTAL_BYTES
+    for path in snapshot.paths:
+        key = str(path)
+        before = snapshot.before.get(key)
+        if before is None:
+            skipped.append(key)
+            continue
+        after = _snapshot_file(path, max_bytes=remaining_bytes)
+        if after is None:
+            skipped.append(key)
+            continue
+        if after.exists:
+            remaining_bytes -= len(after.text.encode("utf-8"))
+        if before == after:
+            continue
+        changes.append(LocalEditChange(path=key, before=before, after=after))
+    return changes, skipped
 
 
 def _result_succeeded(result: str | None) -> bool:
@@ -898,11 +1094,13 @@ def _diff_from_snapshot(snapshot: LocalEditSnapshot | None) -> str | None:
 
     chunks: list[str] = []
     for path in snapshot.paths:
-        before = snapshot.before.get(str(path))
-        after = _snapshot_text(path)
-        if before == after:
+        before_state = snapshot.before.get(str(path))
+        after_state = _snapshot_file(path)
+        if before_state is None or after_state is None or before_state == after_state:
             continue
 
+        before = before_state.text if before_state.exists else None
+        after = after_state.text if after_state.exists else None
         display_path = _display_diff_path(path)
         diff = "".join(
             unified_diff(

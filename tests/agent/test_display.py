@@ -1,6 +1,7 @@
 """Tests for agent/display.py — build_tool_preview() and inline diff previews."""
 
 import json
+import os
 import pytest
 from unittest.mock import MagicMock
 
@@ -209,6 +210,16 @@ class TestEditDiffPreview:
         assert "+++ b/" in diff
         assert "-old" in diff
         assert "+new" in diff
+
+    @pytest.mark.linux_only
+    def test_local_edit_snapshot_refuses_fifo_without_blocking(self, tmp_path):
+        fifo = tmp_path / "edit.fifo"
+        os.mkfifo(fifo)
+
+        snapshot = capture_local_edit_snapshot("write_file", {"path": str(fifo)})
+
+        assert snapshot is not None
+        assert str(fifo) not in snapshot.before
 
 
 

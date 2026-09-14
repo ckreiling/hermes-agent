@@ -2,6 +2,7 @@
 
 
 from acp_adapter.edit_approval import EditProposal
+from agent.display import capture_local_edit_snapshot
 from acp_adapter.tools import (
     TOOL_KIND_MAP,
     build_tool_complete,
@@ -245,6 +246,125 @@ class TestBuildToolComplete:
         assert "Recall should render as a readable summary" in text
         assert "{\"results\"" not in text
         assert result.raw_output is None
+
+    def test_write_file_completion_contains_summary_and_full_file_diff(self, tmp_path):
+        target = tmp_path / "note.txt"
+        original = "heading\nkeep this line\nold value\n"
+        updated = "heading\nkeep this line\nnew value\ntrailer\n"
+        target.write_text(original, encoding="utf-8")
+        snapshot = capture_local_edit_snapshot(
+            "write_file", {"path": str(target)}, task_id="acp-test"
+        )
+        target.write_text(updated, encoding="utf-8")
+
+        result = build_tool_complete(
+            "tc-write",
+            "write_file",
+            '{"bytes_written": 41, "files_modified": ["note.txt"]}\n\n[Hint: context loaded]',
+            function_args={"path": str(target), "content": updated},
+            snapshot=snapshot,
+        )
+
+        summaries = [item for item in result.content if isinstance(item, ContentToolCallContent)]
+        diffs = [item for item in result.content if isinstance(item, FileEditToolCallContent)]
+        assert result.status == "completed"
+        assert any("write_file completed" in item.content.text for item in summaries)
+        assert len(diffs) == 1
+        assert diffs[0].path == str(target)
+        assert diffs[0].old_text == original
+        assert diffs[0].new_text == updated
+
+    def test_completion_without_live_snapshot_does_not_reconstruct_from_result_diff(self, tmp_path):
+        target = tmp_path / "replayed.txt"
+        target.write_text("current filesystem state\n", encoding="utf-8")
+        result = build_tool_complete(
+            "tc-replay",
+            "patch",
+            '{"success": true, "diff": "--- a/replayed.txt\\n+++ b/replayed.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n"}',
+            function_args={"path": str(target), "old_string": "old", "new_string": "new"},
+        )
+
+        assert result.status == "completed"
+        assert not any(isinstance(item, FileEditToolCallContent) for item in result.content)
+        assert any(isinstance(item, ContentToolCallContent) for item in result.content)
+
+    def test_failed_and_noop_edits_do_not_emit_completion_diffs(self, tmp_path):
+        target = tmp_path / "unchanged.txt"
+        target.write_text("same\n", encoding="utf-8")
+        snapshot = capture_local_edit_snapshot(
+            "patch", {"path": str(target)}, task_id="acp-test"
+        )
+
+        failed = build_tool_complete(
+            "tc-failed-edit",
+            "patch",
+            '{"success": false, "error": "old_string not found"}',
+            function_args={"path": str(target)},
+            snapshot=snapshot,
+        )
+        noop = build_tool_complete(
+            "tc-noop-edit",
+            "patch",
+            '{"success": true, "no_change": true, "note": "already applied"}',
+            function_args={"path": str(target)},
+            snapshot=snapshot,
+        )
+
+        assert failed.status == "failed"
+        assert not any(isinstance(item, FileEditToolCallContent) for item in failed.content)
+        assert noop.status == "completed"
+        assert not any(isinstance(item, FileEditToolCallContent) for item in noop.content)
+        assert "already applied" in noop.content[0].content.text
+
+    def test_missing_edit_result_is_not_reported_as_success(self, tmp_path):
+        target = tmp_path / "unknown.txt"
+        target.write_text("before\n", encoding="utf-8")
+        snapshot = capture_local_edit_snapshot(
+            "write_file", {"path": str(target)}, task_id="acp-test"
+        )
+        target.write_text("after\n", encoding="utf-8")
+
+        result = build_tool_complete(
+            "tc-missing-result",
+            "write_file",
+            None,
+            function_args={"path": str(target)},
+            snapshot=snapshot,
+        )
+
+        assert result.status == "failed"
+        assert not any(isinstance(item, FileEditToolCallContent) for item in result.content)
+        assert "unavailable" in result.content[0].content.text.lower()
+
+    def test_large_and_binary_snapshots_are_omitted_instead_of_truncated(self, tmp_path):
+        for name, original in (
+            ("large.txt", "x" * 1_100_000),
+            ("binary.dat", b"prefix\x00suffix"),
+        ):
+            target = tmp_path / name
+            if isinstance(original, bytes):
+                target.write_bytes(original)
+            else:
+                target.write_text(original, encoding="utf-8")
+            snapshot = capture_local_edit_snapshot(
+                "write_file", {"path": str(target)}, task_id="acp-test"
+            )
+            target.write_text("safe replacement\n", encoding="utf-8")
+
+            result = build_tool_complete(
+                f"tc-{name}",
+                "write_file",
+                '{"bytes_written": 17}',
+                function_args={"path": str(target)},
+                snapshot=snapshot,
+            )
+
+            assert not any(isinstance(item, FileEditToolCallContent) for item in result.content)
+            assert any(
+                isinstance(item, ContentToolCallContent)
+                and "could not be captured safely" in item.content.text
+                for item in result.content
+            )
 
 
 

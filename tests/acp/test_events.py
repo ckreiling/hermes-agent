@@ -2,14 +2,16 @@
 
 import asyncio
 import gc
+import json
 import warnings
+from collections import deque
 from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import acp
-from acp.schema import AgentPlanUpdate
+from acp.schema import AgentPlanUpdate, ContentToolCallContent, FileEditToolCallContent
 
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
@@ -152,6 +154,40 @@ class TestStepCallback:
 
 
 
+    @pytest.mark.parametrize("completion_args", ["not-json", '["not", "an", "object"]'])
+    def test_completion_argument_fallback_uses_captured_start_metadata(
+        self, mock_conn, event_loop_fixture, completion_args
+    ):
+        tool_call_ids = {"write_file": deque(["tc-fallback"])}
+        captured_args = {"path": "captured.txt", "content": "after\n"}
+        snapshot = object()
+        tool_call_meta = {
+            "tc-fallback": {"args": captured_args, "snapshot": snapshot}
+        }
+        cb = make_step_cb(
+            mock_conn,
+            "session-1",
+            event_loop_fixture,
+            tool_call_ids,
+            tool_call_meta,
+        )
+
+        with patch("acp_adapter.events._send_update"), \
+             patch("acp_adapter.events.build_tool_complete") as mock_complete:
+            cb(1, [{
+                "name": "write_file",
+                "result": '{"bytes_written": 6}',
+                "arguments": completion_args,
+            }])
+
+        mock_complete.assert_called_once_with(
+            "tc-fallback",
+            "write_file",
+            result='{"bytes_written": 6}',
+            function_args=captured_args,
+            snapshot=snapshot,
+        )
+
     def test_tool_progress_captures_snapshot_metadata(self, mock_conn, event_loop_fixture):
         tool_call_ids = {}
         tool_call_meta = {}
@@ -159,7 +195,7 @@ class TestStepCallback:
 
         with patch("acp_adapter.events.make_tool_call_id", return_value="tc-meta"), \
              patch("acp_adapter.events._send_update") as mock_send, \
-             patch("agent.display.capture_local_edit_snapshot", return_value="snapshot"):
+             patch("agent.display.capture_local_edit_snapshot", return_value="snapshot") as mock_capture:
             cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
             cb("tool.started", "write_file", None, {"path": "diff-test.txt", "content": "hello"})
 
@@ -168,6 +204,11 @@ class TestStepCallback:
             "args": {"path": "diff-test.txt", "content": "hello"},
             "snapshot": "snapshot",
         }
+        mock_capture.assert_called_once_with(
+            "write_file",
+            {"path": "diff-test.txt", "content": "hello"},
+            task_id="session-1",
+        )
         mock_send.assert_called_once()
 
     def test_todo_completion_emits_native_plan_update_after_tool_completion(self, mock_conn, event_loop_fixture):
@@ -201,6 +242,248 @@ class TestStepCallback:
         ]
         assert [entry.status for entry in plan.entries] == ["completed", "in_progress", "completed"]
         assert [entry.priority for entry in plan.entries] == ["medium", "medium", "medium"]
+
+    def test_actual_write_file_callback_emits_empty_new_file_diff(
+        self, mock_conn, event_loop_fixture, tmp_path
+    ):
+        from model_tools import handle_function_call
+
+        session_id = "acp-write-integration"
+        target = tmp_path / "empty.txt"
+        args = {"path": str(target), "content": ""}
+        tool_call_ids = {}
+        tool_call_meta = {}
+        sent = []
+        progress_cb = make_tool_progress_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update", side_effect=lambda *call: sent.append(call[3])):
+            progress_cb("tool.started", "write_file", None, args)
+            raw_result = handle_function_call(
+                "write_file", args, task_id=session_id
+            )
+            step_cb(1, [{
+                "name": "write_file",
+                "result": raw_result,
+                "arguments": json.dumps(args),
+            }])
+
+        assert target.exists()
+        assert target.read_text(encoding="utf-8") == ""
+        completion = next(update for update in sent if update.session_update == "tool_call_update")
+        diffs = [item for item in completion.content if isinstance(item, FileEditToolCallContent)]
+        summaries = [item for item in completion.content if isinstance(item, ContentToolCallContent)]
+        assert completion.status == "completed"
+        assert len(diffs) == 1
+        assert diffs[0].path == str(target)
+        assert diffs[0].old_text is None
+        assert diffs[0].new_text == ""
+        assert any("write_file completed" in item.content.text for item in summaries)
+
+    def test_actual_patch_replace_callback_emits_complete_file_text(
+        self, mock_conn, event_loop_fixture, tmp_path
+    ):
+        from model_tools import handle_function_call
+
+        session_id = "acp-replace-integration"
+        target = tmp_path / "replace.txt"
+        original = "first\nkeep\nold\nlast\n"
+        expected = "first\nkeep\nnew\nlast\n"
+        target.write_text(original, encoding="utf-8")
+        args = {
+            "mode": "replace",
+            "path": str(target),
+            "old_string": "old",
+            "new_string": "new",
+        }
+        tool_call_ids = {}
+        tool_call_meta = {}
+        sent = []
+        progress_cb = make_tool_progress_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update", side_effect=lambda *call: sent.append(call[3])):
+            progress_cb("tool.started", "patch", None, args)
+            raw_result = handle_function_call("patch", args, task_id=session_id)
+            step_cb(1, [{
+                "name": "patch",
+                "result": raw_result,
+                "arguments": json.dumps(args),
+            }])
+
+        assert json.loads(raw_result)["success"] is True
+        assert target.read_text(encoding="utf-8") == expected
+        completion = next(update for update in sent if update.session_update == "tool_call_update")
+        diff = next(item for item in completion.content if isinstance(item, FileEditToolCallContent))
+        assert diff.path == str(target)
+        assert diff.old_text == original
+        assert diff.new_text == expected
+
+    def test_actual_v4a_callback_emits_full_multifile_and_deletion_states(
+        self, mock_conn, event_loop_fixture, tmp_path
+    ):
+        from model_tools import handle_function_call
+
+        session_id = "acp-v4a-integration"
+        updated = tmp_path / "updated.txt"
+        created = tmp_path / "created.txt"
+        deleted = tmp_path / "deleted.txt"
+        updated.write_text("alpha\nkeep\n", encoding="utf-8")
+        deleted.write_text("remove me\n", encoding="utf-8")
+        patch_body = (
+            "*** Begin Patch\n"
+            f"*** Update File: {updated}\n"
+            "@@\n"
+            "-alpha\n"
+            "+beta\n"
+            f"*** Add File: {created}\n"
+            "+created content\n"
+            f"*** Delete File: {deleted}\n"
+            "*** End Patch"
+        )
+        args = {"mode": "patch", "patch": patch_body}
+        tool_call_ids = {}
+        tool_call_meta = {}
+        sent = []
+        progress_cb = make_tool_progress_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update", side_effect=lambda *call: sent.append(call[3])):
+            progress_cb("tool.started", "patch", None, args)
+            raw_result = handle_function_call("patch", args, task_id=session_id)
+            step_cb(1, [{
+                "name": "patch",
+                "result": raw_result,
+                "arguments": json.dumps(args),
+            }])
+
+        assert json.loads(raw_result)["success"] is True
+        completion = next(update for update in sent if update.session_update == "tool_call_update")
+        diffs = {
+            item.path: item
+            for item in completion.content
+            if isinstance(item, FileEditToolCallContent)
+        }
+        assert diffs[str(updated)].old_text == "alpha\nkeep\n"
+        assert diffs[str(updated)].new_text == "beta\nkeep\n"
+        assert diffs[str(created)].old_text is None
+        assert diffs[str(created)].new_text == "created content"
+        assert diffs[str(deleted)].old_text == "remove me\n"
+        assert diffs[str(deleted)].new_text == ""
+        assert any(
+            isinstance(item, ContentToolCallContent)
+            and "protocol has no deletion flag" in item.content.text
+            for item in completion.content
+        )
+
+    def test_actual_failed_patch_keeps_file_and_emits_no_diff(
+        self, mock_conn, event_loop_fixture, tmp_path
+    ):
+        from model_tools import handle_function_call
+
+        session_id = "acp-failure-integration"
+        target = tmp_path / "failure.txt"
+        target.write_text("original\n", encoding="utf-8")
+        args = {
+            "mode": "replace",
+            "path": str(target),
+            "old_string": "missing",
+            "new_string": "replacement",
+        }
+        tool_call_ids = {}
+        tool_call_meta = {}
+        sent = []
+        progress_cb = make_tool_progress_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update", side_effect=lambda *call: sent.append(call[3])):
+            progress_cb("tool.started", "patch", None, args)
+            raw_result = handle_function_call("patch", args, task_id=session_id)
+            step_cb(1, [{
+                "name": "patch",
+                "result": raw_result,
+                "arguments": json.dumps(args),
+            }])
+
+        assert json.loads(raw_result)["error"]
+        assert target.read_text(encoding="utf-8") == "original\n"
+        completion = next(update for update in sent if update.session_update == "tool_call_update")
+        assert completion.status == "failed"
+        assert not any(isinstance(item, FileEditToolCallContent) for item in completion.content)
+
+    def test_parallel_same_name_callbacks_keep_snapshots_with_fifo_ids(
+        self, mock_conn, event_loop_fixture, tmp_path
+    ):
+        from model_tools import handle_function_call
+
+        session_id = "acp-parallel-integration"
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        first.write_text("first before\n", encoding="utf-8")
+        second.write_text("second before\n", encoding="utf-8")
+        first_args = {"path": str(first), "content": "first after\n"}
+        second_args = {"path": str(second), "content": "second after\n"}
+        ids = iter(("tc-first", "tc-second"))
+        tool_call_ids = {}
+        tool_call_meta = {}
+        sent = []
+        progress_cb = make_tool_progress_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(
+            mock_conn, session_id, event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events.make_tool_call_id", side_effect=lambda: next(ids)), \
+             patch("acp_adapter.events._send_update", side_effect=lambda *call: sent.append(call[3])):
+            progress_cb("tool.started", "write_file", None, first_args)
+            progress_cb("tool.started", "write_file", None, second_args)
+            first_result = handle_function_call("write_file", first_args, task_id=session_id)
+            second_result = handle_function_call("write_file", second_args, task_id=session_id)
+            step_cb(1, [
+                {
+                    "name": "write_file",
+                    "result": first_result,
+                    "arguments": json.dumps(first_args),
+                },
+                {
+                    "name": "write_file",
+                    "result": second_result,
+                    "arguments": json.dumps(second_args),
+                },
+            ])
+
+        completions = {
+            update.tool_call_id: update
+            for update in sent
+            if update.session_update == "tool_call_update"
+        }
+        first_diff = next(
+            item for item in completions["tc-first"].content
+            if isinstance(item, FileEditToolCallContent)
+        )
+        second_diff = next(
+            item for item in completions["tc-second"].content
+            if isinstance(item, FileEditToolCallContent)
+        )
+        assert (first_diff.old_text, first_diff.new_text) == ("first before\n", "first after\n")
+        assert (second_diff.old_text, second_diff.new_text) == ("second before\n", "second after\n")
 
 
 

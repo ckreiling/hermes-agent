@@ -158,7 +158,7 @@ def make_tool_progress_cb(
             try:
                 from agent.display import capture_local_edit_snapshot
 
-                snapshot = capture_local_edit_snapshot(name, args)
+                snapshot = capture_local_edit_snapshot(name, args, task_id=session_id)
             except Exception:
                 logger.debug("Failed to capture ACP edit snapshot for %s", name, exc_info=True)
         tool_call_meta[tc_id] = {"args": args, "snapshot": snapshot}
@@ -234,6 +234,14 @@ def make_step_cb(
                 elif isinstance(tool_info, str):
                     tool_name = tool_info
 
+                if isinstance(function_args, str):
+                    try:
+                        function_args = json.loads(function_args)
+                    except (json.JSONDecodeError, TypeError):
+                        function_args = None
+                if not isinstance(function_args, dict):
+                    function_args = None
+
                 queue = tool_call_ids.get(tool_name or "")
                 if isinstance(queue, str):
                     queue = deque([queue])
@@ -241,11 +249,17 @@ def make_step_cb(
                 if tool_name and queue:
                     tc_id = queue.popleft()
                     meta = tool_call_meta.pop(tc_id, {})
+                    captured_args = meta.get("args")
+                    completion_args = (
+                        function_args
+                        if isinstance(function_args, dict)
+                        else captured_args if isinstance(captured_args, dict) else None
+                    )
                     update = build_tool_complete(
                         tc_id,
                         tool_name,
                         result=str(result) if result is not None else None,
-                        function_args=function_args or meta.get("args"),
+                        function_args=completion_args,
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)
