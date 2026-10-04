@@ -38,6 +38,7 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TAVILY_API_KEY",
         "TAVILY_BASE_URL",
         "EXA_API_KEY",
+        "EXA_BASE_URL",
         "PARALLEL_API_KEY",
         "PARALLEL_SEARCH_MODE",
         "FIRECRAWL_API_KEY",

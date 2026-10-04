@@ -114,7 +114,7 @@ def _get_backend() -> str:
     # Free tiers trail paid.
     backend_candidates = (
         ("tavily", _has_env("TAVILY_API_KEY")), ("perplexity", _has_env("PERPLEXITY_API_KEY")),
-        ("exa", _has_env("EXA_API_KEY")),
+        ("exa", _has_env("EXA_API_KEY") or _has_env("EXA_BASE_URL")),
         ("parallel", _has_env("PARALLEL_API_KEY")), ("keenable", _has_env("KEENABLE_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
         ("firecrawl", _is_tool_gateway_ready()), ("searxng", _has_env("SEARXNG_URL")),
@@ -178,7 +178,7 @@ def _xai_available() -> bool:
 # check_firecrawl_api_key) are honored at call time. ``xai`` is probed via has_xai_credentials(), not a
 # registered provider, though the registry's _LEGACY_PREFERENCE omits it — drop it if xai ever registers.
 _BUILTIN_AVAILABILITY = {
-    "exa": lambda: _has_env("EXA_API_KEY"),
+    "exa": lambda: _has_env("EXA_API_KEY") or _has_env("EXA_BASE_URL"),
     "parallel": lambda: _has_env("PARALLEL_API_KEY"),
     "keenable": lambda: _has_env("KEENABLE_API_KEY"),
     "firecrawl": lambda: check_firecrawl_api_key(),

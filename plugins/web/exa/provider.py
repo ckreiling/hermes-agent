@@ -1,17 +1,20 @@
 """Exa web search + content extraction via the ``exa-py`` SDK (lazy-installed).
 
-Env: ``EXA_API_KEY`` (https://exa.ai). Both methods are sync — Exa's SDK is
+Env: ``EXA_API_KEY`` (https://exa.ai), optional ``EXA_BASE_URL`` for REST gateways.
+A custom gateway may omit the vendor key. Both methods are sync — Exa's SDK is
 sync-only; the dispatcher threads extract when the caller is async.
 """
 
 from __future__ import annotations
 
 import logging
+import ipaddress
+from urllib.parse import urlsplit
 from typing import Any, Dict, List
 
 from plugins.web._common import (
     BaseWebSearchProvider, cached_sdk_client, document, keyless_extract, keyless_search, keyless_variant_schema,
-    provider_env, run_extract, run_search, search_ok, use_keyless, web_hit,
+    provider_env, run_extract, run_search, search_ok, use_keyless, web_hit, lazy_ensure,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,7 +22,33 @@ logger = logging.getLogger(__name__)
 _MISSING_KEY = "EXA_API_KEY environment variable not set. Get your API key at https://exa.ai"
 
 
+def _custom_base_url() -> str:
+    url = provider_env("EXA_BASE_URL").rstrip("/")
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    loopback = parsed.hostname == "localhost"
+    try:
+        loopback = loopback or ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        pass
+    if (not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or (parsed.scheme != "https" and not (parsed.scheme == "http" and loopback))):
+        raise ValueError("EXA_BASE_URL must be HTTPS (or loopback HTTP), without credentials, query, or fragment")
+    return url
+
+
 def _get_exa_client() -> Any:
+    base_url = _custom_base_url()
+    if base_url:
+        lazy_ensure("search.exa")
+        from exa_py import Exa
+        # Authenticated gateways need no vendor key. The SDK requires a nonempty
+        # key; this non-secret placeholder is sent only to the configured gateway.
+        client = Exa(api_key=provider_env("EXA_API_KEY") or "implicit", base_url=base_url)
+        client.headers["x-exa-integration"] = "hermes-agent"
+        return client
     def _factory(api_key: str) -> Any:
         from exa_py import Exa  # deliberately lazy
         client = Exa(api_key=api_key)
@@ -38,9 +67,12 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
     EXTRACT = True
     KEYLESS = True
 
+    def is_available(self) -> bool:
+        return bool(provider_env("EXA_BASE_URL")) or super().is_available()
+
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         def _body() -> Dict[str, Any]:
-            if use_keyless("exa", provider_env("EXA_API_KEY")):
+            if not _custom_base_url() and use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_search("Exa", "exa", query, limit, logger)
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
             response = _get_exa_client().search(query, num_results=limit, contents={"highlights": True})
@@ -53,7 +85,7 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
 
     def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         def _body() -> List[Dict[str, Any]]:
-            if use_keyless("exa", provider_env("EXA_API_KEY")):
+            if not _custom_base_url() and use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_extract("Exa", "exa", urls, logger)
             logger.info("Exa extract: %d URL(s)", len(urls))
             response = _get_exa_client().get_contents(urls, text=True)

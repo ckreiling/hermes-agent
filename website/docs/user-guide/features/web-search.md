@@ -14,6 +14,36 @@ Hermes Agent includes two model-callable web tools backed by multiple providers:
 
 Both are configured through a single backend selection. Providers are chosen via `hermes tools` or set directly in `config.yaml`.
 
+## Custom Exa REST gateways
+
+The bundled Exa provider supports an optional `EXA_BASE_URL` environment variable.
+Set it in the active profile's `.env`, for example:
+
+```dotenv
+EXA_BASE_URL=https://exa.int.exe.xyz
+```
+
+Select the bundled provider for both tools:
+
+```yaml
+web:
+  backend: exa
+  search_backend: exa
+  extract_backend: exa
+```
+
+Restart Hermes after changing these settings. The provider calls `/search` for
+search results with highlights and `/contents` for page text. Custom URLs must
+use HTTPS; HTTP is allowed only for loopback development servers. Credentials
+in URLs, query strings, and fragments are rejected.
+
+`EXA_API_KEY` remains optional for gateways that supply upstream authentication.
+When absent, the SDK sends the non-secret placeholder `implicit` to the configured
+gateway, never to the public Exa endpoint. If the gateway requires a key, set
+`EXA_API_KEY` normally. A custom endpoint takes precedence over the public keyless
+MCP tier, including when the free tier is selected. Without `EXA_BASE_URL`, existing
+keyed and keyless Exa behavior is unchanged.
+
 ## Backends
 
 | Provider | Env Var | Search | Extract | Free tier |
