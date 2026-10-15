@@ -54,6 +54,11 @@ class TestBuildToolPreview:
 
 
 
+    def test_memory_patch_preview_shows_the_span_being_edited(self):
+        args = {"action": "patch", "target": "memory", "old_text": "port 8080", "content": "port 9090"}
+        assert build_tool_preview("memory", args) == '~memory: "port 8080"'
+        assert '~memory: "port 8080"' in get_cute_tool_message("memory", args, 0.1)
+
     def test_browser_type_preview_redacts_api_key(self):
         secret = "sk-proj-ABCD1234567890EFGH"
         result = build_tool_preview("browser_type", {"ref": "@e3", "text": secret})
@@ -223,7 +228,7 @@ class TestEditDiffPreview:
         assert "-old" in diff
         assert "+new" in diff
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_local_edit_snapshot_refuses_fifo_without_blocking(self, tmp_path):
         fifo = tmp_path / "edit.fifo"
         os.mkfifo(fifo)
