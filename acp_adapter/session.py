@@ -6,7 +6,7 @@ survive process restarts and appear in ``session_search``; ``load_session`` /
 """
 from __future__ import annotations
 
-from hermes_constants import get_hermes_home, translate_cwd_for_wsl_backend, windows_path_to_wsl
+from hermes_constants import get_hermes_home, parse_reasoning_effort, translate_cwd_for_wsl_backend, windows_path_to_wsl
 
 import copy
 import json
@@ -151,6 +151,8 @@ class SessionState:
     # Per-session allocator for ACP assistant messageIds (lazily created by
     # the server so streamed chunks group into distinct assistant replies).
     message_ids: Any = None
+    # None inherits YAML defaults; the string "none" is an explicit disable.
+    reasoning_effort_override: str | None = None
 
 
 class SessionManager:
@@ -201,9 +203,12 @@ class SessionManager:
         if original is None:
             return None
         new_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None)
+        effort = original.reasoning_effort_override
+        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None,
+                                 reasoning_effort_override=effort)
         model = getattr(agent, "model", original.model) or original.model
-        state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
+        state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history),
+                                    reasoning_effort_override=effort)
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -304,10 +309,12 @@ class SessionManager:
     # ---- persistence via SessionDB ------------------------------------------
 
     def _install_state(self, session_id: str, agent: Any, cwd: str, model: str,
-                       history: list[dict[str, Any]], *, persist: bool = True) -> SessionState:
+                       history: list[dict[str, Any]], *, persist: bool = True,
+                       reasoning_effort_override: str | None = None) -> SessionState:
         """Build a SessionState, register it in memory, bind its cwd for tools, optionally persist."""
         state = SessionState(session_id=session_id, agent=agent, cwd=cwd, model=model,
-                             history=history, cancel_event=threading.Event())
+                             history=history, cancel_event=threading.Event(),
+                             reasoning_effort_override=reasoning_effort_override)
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
@@ -348,6 +355,8 @@ class SessionManager:
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
+        if state.reasoning_effort_override is not None:
+            session_meta["acp_reasoning_effort"] = state.reasoning_effort_override
         for key in ("provider", "base_url", "api_mode"):
             value = getattr(state.agent, "requested_provider", None) if key == "provider" else None
             if not (isinstance(value, str) and value.strip()):
@@ -469,6 +478,10 @@ class SessionManager:
 
         meta = _parse_model_config(row.get("model_config"))
         cwd, model = meta.get("cwd", "."), row.get("model") or None
+        effort = meta.get("acp_reasoning_effort")
+        if effort is not None and (not isinstance(effort, str) or parse_reasoning_effort(effort) is None):
+            logger.warning("Ignoring invalid persisted ACP reasoning effort for %s", session_id)
+            effort = None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
@@ -484,7 +497,8 @@ class SessionManager:
         try:
             agent = self._make_agent(
                 session_id=session_id, cwd=cwd, model=model, api_mode=restored_api_mode,
-                requested_provider=requested_provider, base_url=restored_base_url)
+                requested_provider=requested_provider, base_url=restored_base_url,
+                reasoning_effort_override=effort)
         except Exception:
             # The persisted provider metadata could not reconstruct an agent
             # (e.g. legacy rows that stored the normalized "custom" provider
@@ -514,6 +528,7 @@ class SessionManager:
                     session_id=session_id,
                     cwd=cwd,
                     model=model,
+                    reasoning_effort_override=effort,
                 )
             except Exception:
                 logger.warning(
@@ -524,7 +539,7 @@ class SessionManager:
                 return None
 
         state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
-                                    history, persist=False)
+                                    history, persist=False, reasoning_effort_override=effort)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
@@ -532,11 +547,19 @@ class SessionManager:
 
     def _make_agent(self, *, session_id: str, cwd: str, model: str | None = None,
                     requested_provider: str | None = None, base_url: str | None = None, api_mode: str | None = None,
-                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None):
-        """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
-        them from config (fresh session)."""
+                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None,
+                    reasoning_effort_override: str | None = None):
+        """Carry session toolsets and explicit reasoning into rebuilds; otherwise inherit config."""
+        reasoning_override = None
+        if reasoning_effort_override is not None:
+            reasoning_override = parse_reasoning_effort(reasoning_effort_override)
+            if reasoning_override is None:
+                raise ValueError(f"Invalid ACP reasoning effort: {reasoning_effort_override}")
         if self._agent_factory is not None:
-            return self._agent_factory()
+            agent = self._agent_factory()
+            if reasoning_override is not None:
+                agent.reasoning_config = reasoning_override
+            return agent
 
         from run_agent import AIAgent
         from agent.skill_utils import parse_config_string_list
@@ -571,7 +594,8 @@ class SessionManager:
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
             # reaches an ACP session and the transport applies its default effort (a 400 on non-reasoning
             # models). Resolved against the session's model so per-model overrides apply.
-            "reasoning_config": resolve_reasoning_config(config, model or default_model),
+            "reasoning_config": (reasoning_override if reasoning_override is not None
+                                 else resolve_reasoning_config(config, model or default_model)),
         }
         resolve_error: Exception | None = None
         try:

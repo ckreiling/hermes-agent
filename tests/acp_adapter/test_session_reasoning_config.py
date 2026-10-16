@@ -54,6 +54,21 @@ def test_acp_agent_receives_configured_reasoning(acp_env):
     assert agent.kwargs["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
+@pytest.mark.parametrize("effort", ["none", "low", "high"])
+def test_acp_session_override_wins_over_global_and_model_defaults(acp_env, effort):
+    from hermes_constants import parse_reasoning_effort
+
+    acp_env({"model": {"default": "gpt-6-sol", "provider": "openai-api"},
+             "agent": {"reasoning_effort": "xhigh", "reasoning_overrides": {"gpt-6-sol": "max"}}})
+    manager = SessionManager(db=None)
+    manager._get_db = lambda: None
+    agent = manager._make_agent(session_id="override", cwd=".", reasoning_effort_override=effort)
+    assert agent.kwargs["reasoning_config"] == parse_reasoning_effort(effort)
+    assert manager._make_agent(session_id="default", cwd=".").kwargs["reasoning_config"] == {
+        "enabled": True, "effort": "max",
+    }
+
+
 def test_acp_agent_receives_custom_provider_request_body(acp_env, monkeypatch):
     """#103738: the resolver's ``request_overrides`` (a custom entry's ``extra_body``) reach the ACP agent, as
     on the CLI; an explicit base_url naming a different endpoint does not inherit them."""
