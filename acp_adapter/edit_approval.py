@@ -18,6 +18,8 @@ from itertools import count
 from pathlib import Path
 from typing import Any, Callable
 
+from .operations import ToolCallOperations
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,12 +214,15 @@ def make_acp_edit_approval_requester(
     request_permission_fn: Callable, loop: asyncio.AbstractEventLoop, session_id: str,
     timeout: float | None = None, auto_approve_getter: Callable[[], tuple[str, str | None]] | None = None,
     send_update: Callable[[object], None] | None = None,
+    operations: ToolCallOperations | None = None,
 ) -> EditApprovalRequester:
     """Return a sync requester that bridges edit proposals to ACP permissions."""
 
+    operations = operations or ToolCallOperations(send_update or (lambda update: None))
+
     def _requester(proposal: EditProposal) -> bool:
         from acp.schema import PermissionOption
-        from acp_adapter.permissions import await_permission, resolve_permission_timeout
+        from acp_adapter.permissions import resolve_permission_timeout
 
         if auto_approve_getter is not None:
             try:
@@ -228,11 +233,11 @@ def make_acp_edit_approval_requester(
             except Exception:
                 logger.debug("ACP edit auto-approval policy check failed", exc_info=True)
 
-        response, _timed_out = await_permission(
+        response, _timed_out = operations.request_permission(
             request_permission_fn, loop, session_id, tool_call=build_acp_edit_tool_call(proposal),
             options=[PermissionOption(option_id="allow_once", kind="allow_once", name="Allow edit"),
                      PermissionOption(option_id="deny", kind="reject_once", name="Deny")],
-            timeout=resolve_permission_timeout(timeout), what="Edit approval request", send_update=send_update,
+            timeout=resolve_permission_timeout(timeout), what="Edit approval request",
         )
         outcome = getattr(response, "outcome", None)
         return getattr(outcome, "outcome", None) == "selected" and getattr(outcome, "option_id", None) == "allow_once"

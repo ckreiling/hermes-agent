@@ -16,6 +16,8 @@ from typing import Any, Callable, Deque, Dict
 import acp
 from acp.schema import AgentPlanUpdate, PlanEntry
 
+from .operations import ToolCallOperations
+
 from .tools import (
     _json_loads_maybe, build_tool_abandoned, build_tool_complete, build_tool_start, coerce_tool_args,
     make_tool_call_id,
@@ -79,6 +81,7 @@ def _upgrade_queue(tool_call_ids: dict[str, deque[str]], name: str) -> deque[str
 def close_tool_call(
     conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
     tool_call_meta: dict[str, dict[str, Any]], name: str, result: Any = None, is_error: bool = False,
+    operations: ToolCallOperations | None = None,
 ) -> str | None:
     """Close the oldest open ACP tool call for ``name``; returns its id, or None when none is open."""
     queue = _upgrade_queue(tool_call_ids, name)
@@ -86,6 +89,8 @@ def close_tool_call(
         return None
     tc_id = queue.popleft()
     meta = tool_call_meta.pop(tc_id, {})
+    if operations is not None:
+        operations.retire(tc_id)
     _send_update(conn, session_id, loop, build_tool_complete(
         tc_id, name, result=str(result) if result is not None else None,
         function_args=meta.get("args"), snapshot=meta.get("snapshot"), is_error=is_error,
@@ -98,6 +103,7 @@ def close_tool_call(
 def flush_open_tool_calls(
     conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
     tool_call_meta: dict[str, dict[str, Any]],
+    operations: ToolCallOperations | None = None,
 ) -> int:
     """Close every tool call still open at the end of a turn, and report how many there were.
 
@@ -108,6 +114,8 @@ def flush_open_tool_calls(
     flushed = 0
     for name, ids in open_calls:
         for tc_id in ids:
+            if operations is not None:
+                operations.retire(tc_id)
             tool_call_meta.pop(tc_id, None)
             _send_update(conn, session_id, loop, build_tool_abandoned(tc_id, name))
             flushed += 1
@@ -122,6 +130,7 @@ def make_tool_progress_cb(
     tool_call_meta: dict[str, dict[str, Any]],
     edit_approval_policy_getter: Callable[[], tuple[str, str | None]] | None = None,
     turn_state: dict[str, Any] | None = None,
+    operations: ToolCallOperations | None = None,
 ) -> Callable:
     """Create a ``tool_progress_callback`` for AIAgent.
 
@@ -139,9 +148,10 @@ def make_tool_progress_cb(
             close_tool_call(
                 conn, session_id, loop, tool_call_ids, tool_call_meta, name, kwargs.get("result"),
                 is_error=bool(kwargs.get("is_error")),
+                operations=operations,
             )
             return
-        if event_type != "tool.started":
+        if event_type != "tool.started" or not name:
             return
         args = coerce_tool_args(args)
         tc_id = make_tool_call_id()
@@ -173,7 +183,10 @@ def make_tool_progress_cb(
             except Exception:
                 logger.debug("Failed to prepare auto-approved ACP edit diff for %s", name, exc_info=True)
 
-        _send_update(conn, session_id, loop, build_tool_start(tc_id, name, args, edit_diff=edit_diff))
+        start = build_tool_start(tc_id, name, args, edit_diff=edit_diff)
+        if operations is not None:
+            operations.bind(start)
+        _send_update(conn, session_id, loop, start)
 
     return _tool_progress
 
@@ -256,6 +269,7 @@ def make_message_cb(
 def make_step_cb(
     conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
     tool_call_meta: dict[str, dict[str, Any]], turn_state: dict[str, Any] | None = None,
+    operations: ToolCallOperations | None = None,
 ) -> Callable:
     """Create a ``step_callback(api_call_count: int, prev_tools: list)`` for AIAgent."""
 
@@ -290,6 +304,8 @@ def make_step_cb(
                     continue
                 tc_id = queue.popleft()
                 meta = tool_call_meta.pop(tc_id, {})
+                if operations is not None:
+                    operations.retire(tc_id)
                 # ``prev_tools`` carries the wire ``arguments`` JSON *string*; the content
                 # builders index it as a dict, so an uncoerced string raised inside this
                 # (swallowed) callback and the bubble never closed.

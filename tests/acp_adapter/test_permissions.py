@@ -230,7 +230,10 @@ class TestPermissionRequestToolCallReachesATerminalStatus:
     ])
     def test_command_permission_request_is_closed_per_outcome(self, outcome, status):
         requested, sent = self._run(make_approval_callback, outcome, lambda cb: cb("rm -rf /", "dangerous"))
-        assert [(u.tool_call_id, u.status) for u in sent] == [(requested.tool_call_id, status)]
+        assert [(u.tool_call_id, u.status) for u in sent] == [
+            (requested.tool_call_id, "pending"), (requested.tool_call_id, status),
+        ]
+        assert sent[0].session_update == "tool_call"
 
     def test_denied_edit_approval_request_is_closed_as_failed(self):
         from acp_adapter.edit_approval import EditProposal, make_acp_edit_approval_requester
@@ -239,7 +242,9 @@ class TestPermissionRequestToolCallReachesATerminalStatus:
         requested, sent = self._run(
             make_acp_edit_approval_requester, DeniedOutcome(outcome="cancelled"), lambda cb: cb(proposal),
         )
-        assert [(u.tool_call_id, u.status) for u in sent] == [(requested.tool_call_id, "failed")]
+        assert [(u.tool_call_id, u.status) for u in sent] == [
+            (requested.tool_call_id, "pending"), (requested.tool_call_id, "failed"),
+        ]
 
     def test_allowed_edit_approval_request_is_closed_as_completed_once(self):
         """Live regression: a client answering with a plain ``selected`` outcome (not the SDK
@@ -260,7 +265,9 @@ class TestPermissionRequestToolCallReachesATerminalStatus:
             decisions.append(requester(proposal))
         requested = request_permission.call_args.kwargs["tool_call"]
         assert decisions == [True]
-        assert [(u.tool_call_id, u.status) for u in sent] == [(requested.tool_call_id, "completed")]
+        assert [(u.tool_call_id, u.status) for u in sent] == [
+            (requested.tool_call_id, "pending"), (requested.tool_call_id, "completed"),
+        ]
 
 
 def test_default_permission_timeout_follows_approvals_config(monkeypatch):

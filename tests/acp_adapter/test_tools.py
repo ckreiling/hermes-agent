@@ -152,7 +152,7 @@ class TestBuildToolStart:
         assert "https://x.com" in result.title
         assert result.kind == "fetch"
         assert "https://x.com" in result.content[0].content.text
-        assert result.raw_input is None
+        assert result.raw_input == args
 
 
 

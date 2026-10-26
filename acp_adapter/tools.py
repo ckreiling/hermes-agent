@@ -10,7 +10,8 @@ from typing import Any, Callable, Dict, List, Optional
 import acp
 from acp.schema import ToolCallLocation, ToolCallProgress, ToolCallStart, ToolKind
 
-from agent.display import build_tool_preview
+from agent.display import build_tool_preview, redact_tool_args_for_display
+from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -889,6 +890,9 @@ def build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit
     title/content/location builders falls back to a minimal valid start event
     (mirrors ``get_cute_tool_message`` in ``agent/display.py``)."""
     try:
+        arguments = json.loads(redact_sensitive_text(
+            json.dumps(redact_tool_args_for_display(tool_name, arguments), ensure_ascii=False), force=True,
+        ))
         return _build_tool_start(tool_call_id, tool_name, arguments, edit_diff=edit_diff)
     except Exception as exc:
         logger.debug("ACP tool-start render failed for %r: %s", tool_name, exc)
@@ -898,7 +902,12 @@ def build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit
 
 def _build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit_diff: Any = None) -> ToolCallStart:
     """Build the ToolCallStart event (unguarded; see ``build_tool_start``)."""
-    raw_input = None
+    # Structured invocation data is independent of the compact title/content.
+    raw_input = dict(arguments)
+    if tool_name == "execute_code" and isinstance(arguments.get("code"), str):
+        # ACP execute consumers use `command` for the executable source, whether
+        # shell or Python. Preserve the native `code` argument alongside it.
+        raw_input["command"] = arguments["code"]
     if tool_name in ("patch", "write_file") and edit_diff is not None:
         content = [acp.tool_diff_content(path=edit_diff.path, old_text=edit_diff.old_text, new_text=edit_diff.new_text)]
     elif tool_name in _START_CONTENT_BUILDERS:

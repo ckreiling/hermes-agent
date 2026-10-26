@@ -230,6 +230,7 @@ class _TurnCallbacks:
     streamed: bool = False
     tool_call_ids: Any = None
     tool_call_meta: Any = None
+    operations: Any = None
 
 
 class HermesACPAgent(SlashCommandsMixin, acp.Agent):
@@ -930,9 +931,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if not conn or cbs.tool_call_ids is None:
             return
         try:
-            flush_open_tool_calls(conn, session_id, loop, cbs.tool_call_ids, cbs.tool_call_meta or {})
+            flush_open_tool_calls(
+                conn, session_id, loop, cbs.tool_call_ids, cbs.tool_call_meta or {}, operations=cbs.operations,
+            )
         except Exception:
             logger.debug("Could not flush open ACP tool calls for %s", session_id, exc_info=True)
+        finally:
+            if cbs.operations is not None:
+                cbs.operations.close()
 
     def _wire_turn_callbacks(
         self, state: SessionState, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
@@ -946,10 +952,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # Shared with the step callback so a runtime that projects
             # ``tool.completed`` closes each call once, not twice.
             turn_state: dict[str, Any] = {}
+            from acp_adapter.operations import ToolCallOperations
+
+            send_update = lambda update: _send_update(conn, session_id, loop, update)
+            cbs.operations = ToolCallOperations(send_update)
             policy_getter = lambda: self._edit_approval_policy_for_state(state)
             cbs.tool_progress_cb = make_tool_progress_cb(
                 conn, session_id, loop, tool_call_ids, tool_call_meta, edit_approval_policy_getter=policy_getter,
-                turn_state=turn_state,
+                turn_state=turn_state, operations=cbs.operations,
             )
             # Per-session allocator: a new turn must never reuse a previous turn's
             # assistant messageId (ACP clients replace the bubble with that id).
@@ -957,7 +967,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.message_ids = AssistantMessageIdAllocator()
             state.message_ids.close()  # new turn -> next chunk opens a fresh id
             cbs.reasoning_cb = make_thinking_cb(conn, session_id, loop, state.message_ids)
-            cbs.step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta, turn_state)
+            cbs.step_cb = make_step_cb(
+                conn, session_id, loop, tool_call_ids, tool_call_meta, turn_state, operations=cbs.operations,
+            )
             message_cb = make_message_cb(conn, session_id, loop, state.message_ids)
 
             def stream_delta_cb(text: str) -> None:
@@ -965,15 +977,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 message_cb(text)
 
             cbs.stream_delta_cb = stream_delta_cb
-            # Closes the synthetic permission-request bubble once the user has answered.
-            send_update = lambda update: _send_update(conn, session_id, loop, update)
-            cbs.approval_cb = make_approval_callback(conn.request_permission, loop, session_id, send_update=send_update)
+            cbs.approval_cb = make_approval_callback(
+                conn.request_permission, loop, session_id, operations=cbs.operations,
+            )
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
                 cbs.edit_approval_requester = make_acp_edit_approval_requester(
                     conn.request_permission, loop, session_id, auto_approve_getter=policy_getter,
-                    send_update=send_update,
+                    operations=cbs.operations,
                 )
             except Exception:
                 logger.debug("Could not create ACP edit approval requester", exc_info=True)
