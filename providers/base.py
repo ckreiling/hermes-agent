@@ -292,6 +292,16 @@ class ProviderProfile:
         """
         return None
 
+    def get_model_capabilities(self, model: str, *, allow_network: bool = False) -> dict[str, Any]:
+        """Exact-model metadata in the ``model_overrides`` schema, or {} when unknown.
+
+        Dynamic catalogs may override this alongside ``fetch_models`` so native request IDs
+        carry their own capability verdicts, rather than inheriting a provider-wide flag.
+        Honor ``allow_network=False`` on hot paths, cache per owning profile/endpoint, and
+        return {} on discovery failure. Explicit user overrides still win in models.dev.
+        """
+        return self.model_capabilities.get(model, {})
+
     def resolve_aux_model(self, *, vision: bool = False) -> str:
         """Return a LIVE cheap-model id for auxiliary tasks, or "".
 

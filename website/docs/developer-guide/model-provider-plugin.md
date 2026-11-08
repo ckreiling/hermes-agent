@@ -147,6 +147,15 @@ Keys are exact model IDs. Values use the `model_overrides` schema from
 optional `model_family` — and omitted fields stay unknown (not `False`), so a
 partial entry patches catalog metadata without erasing it.
 
+For a dynamic catalog, override `get_model_capabilities(model, *, allow_network=False)`
+to return the same partial metadata schema (the default reads `model_capabilities`).
+Resolve only identities advertised by that provider, including any catalog-declared
+native/canonical aliases; do not infer vision from a model-name prefix or a provider-wide
+flag. Honor `allow_network=False` for hot-path callers, scope caches to the owning profile
+and endpoint, and return `{}` on unknown models or discovery failure. Image routing allows
+a cached/bounded catalog fetch; explicit user overrides retain their precedence. Publishing
+IDs through `fetch_models` alone does not declare their image-input capabilities.
+
 One declaration feeds every consumer that reads the catalog through
 `agent.models_dev`: the `/model` picker's `reasoning` badge, image routing
 (`decide_image_input_mode` goes `native` for a `supports_vision: True` model

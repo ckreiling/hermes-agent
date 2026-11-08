@@ -657,7 +657,7 @@ def lookup_models_dev_context(provider: str, model: str, *, allow_network: bool 
     override_ctx = _override_context_window(provider, model)
     if override_ctx is not None:
         return override_ctx
-    declared_ctx = _override_int(_provider_model_capabilities(provider, model), "context_window")
+    declared_ctx = _override_int(_provider_model_capabilities(provider, model, allow_network=allow_network), "context_window")
     if declared_ctx is not None:
         return declared_ctx
     models = _get_provider_models(provider, allow_network=allow_network)
@@ -864,25 +864,26 @@ def _relay_vision_marker_metadata(provider: str, model: str) -> Optional[dict[st
     return {**_UNKNOWN_MODEL_BASE, "modalities": {"input": ["text", "image"], "output": ["text"]}}
 
 
-def _provider_model_capabilities(provider: str, model: str) -> dict[str, Any]:
-    """Exact-model declaration from the registered ``ProviderProfile.model_capabilities`` (canonical
+def _provider_model_capabilities(provider: str, model: str, *, allow_network: bool = False) -> dict[str, Any]:
+    """Exact-model declaration from ``ProviderProfile.get_model_capabilities`` (canonical
     ``model_overrides`` schema). The ONE plugin seam: every consumer that reads models.dev through this
     module (picker badges, image routing, ``/api/model/info``, context lookup) sees it (#102115)."""
     from providers import get_provider_profile
 
     profile = get_provider_profile(provider)
-    return profile.model_capabilities.get(model, {}) if profile is not None else {}
+    return profile.get_model_capabilities(model, allow_network=allow_network) if profile is not None else {}
 
 
 def _apply_overrides(
     provider: str, model: str, entry: Optional[dict[str, Any]], *, config: Optional[dict[str, Any]] = None,
+    allow_network: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Catalog/builtin metadata, patched by the plugin's declaration, then by the explicit user override.
     ``_UNKNOWN_MODEL_BASE`` is the base on a catalog miss; a fill-gap ``_default`` applies only when no
     source knows the model. None when nothing knows it."""
     builtin = _builtin_model_metadata(provider, model, config=config)
     base = entry if entry is not None else builtin
-    declared = _provider_model_capabilities(provider, model)
+    declared = _provider_model_capabilities(provider, model, allow_network=allow_network)
     if declared:
         base = _merge_catalog_entry_with_override(base if base is not None else _UNKNOWN_MODEL_BASE, declared)
     override = _override_for(provider, model, catalog_hit=base is not None, config=config)
@@ -916,7 +917,7 @@ def get_model_capabilities(
         entry is None
         and _builtin_model_metadata(provider, model, config=config) is None
     )
-    raw = _apply_overrides(provider, model, entry, config=config)
+    raw = _apply_overrides(provider, model, entry, config=config, allow_network=allow_network)
     if raw is None:
         return None
     return ModelCapabilities(
@@ -1028,5 +1029,5 @@ def get_model_info(
     models = _registry_models(mdev_id, allow_network=allow_network)
     mid, entry = next(_iter_model_entries(models, model_id, suffix_fallback=False, provider=provider_id), (model_id, None)) if models is not None else (model_id, None)
     # Not in catalog — an override (explicit or _default) may still provide it.
-    raw = _apply_overrides(provider_id, model_id, entry, config=config)
+    raw = _apply_overrides(provider_id, model_id, entry, config=config, allow_network=allow_network)
     return _parse_model_info(mid, raw, mdev_id) if raw is not None else None
