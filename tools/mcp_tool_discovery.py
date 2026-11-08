@@ -315,7 +315,13 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
         server = _core._servers.get(key)
         is_lazy = key in _core._lazy_server_configs
     if is_lazy and (server is None or server.session is None):
-        _ensure_lazy_server_connected(server_name)
+        from tools.registry import session_tool_scope
+        # A profile's lazy config must connect/register under that profile, never the editor overlay.
+        if key != _server_key(server_name):
+            with session_tool_scope(None):
+                _ensure_lazy_server_connected(server_name)
+        else:
+            _ensure_lazy_server_connected(server_name)
     elif server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
     else:
@@ -837,8 +843,13 @@ def get_mcp_status(configured: Optional[dict[str, dict]] = None, *, include_runt
     if not configured:
         return []
     current_scope = _core._mcp_registry_scope()
+    from tools.registry import current_session_tool_scope
+    bound_session = current_scope is not None and current_scope == current_session_tool_scope()
     with _core._lock:
         def visible(key) -> bool:
+            # Match invocation precedence in an additive editor view, without exposing sibling keys.
+            if bound_session:
+                return include_runtime and key == _resolve_server_key(_key_name(key))
             # Runtime state belongs to the profile that adopted it; under a multiplexer only that
             # profile's view may show it, and ``include_runtime=False`` hides the launch profile's
             # servers from a status read scoped to a different profile.
@@ -851,7 +862,7 @@ def get_mcp_status(configured: Optional[dict[str, dict]] = None, *, include_runt
         # adoption/teardown maps a lazy server never populates, so use the registration-level
         # predicate ``_resolve_server_key`` already relies on for this state.
         lazy_tools = {_key_name(k): len(v) for k, v in _core._lazy_server_tool_names.items()
-                      if include_runtime and _key_visible_in_scope(k, current_scope)
+                      if include_runtime and (visible(k) if bound_session else _key_visible_in_scope(k, current_scope))
                       and k in _core._lazy_server_configs}
 
     result: list[dict] = []

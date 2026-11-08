@@ -51,15 +51,40 @@ def _key_visible_in_scope(key: ServerKey, scope: Optional[str]) -> bool:
 def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool = True) -> ServerKey:
     """The connection key a call to *name* from *scope* must use: the scope's own connection
     (live, connecting or lazily registered) when it has one, else a shared connection it
-    adopted, else its own (not yet existing) key so bookkeeping lands under this scope."""
+    adopted. A bound editor may then inherit its current profile's connection; a miss keeps
+    its own key so bookkeeping remains confined to the requesting scope."""
     if scope is None and current:
         scope = _core._mcp_registry_scope()
     own = _server_key(name, scope, current=False)
-    if scope is None or own in _core._servers or own in _core._lazy_server_configs:
+    if (scope is None or own in _core._servers or own in _core._lazy_server_configs
+            or own in _core._server_connecting):
         return own
     for key, scopes in _core._server_tool_scopes.items():
         if scope in scopes and _key_name(key) == name and key in _core._servers:
             return key
+    # Session registries are additive to the CURRENT profile, not to sibling editors or
+    # the launch profile. Explicit maintenance lookups remain confined to their named scope.
+    from tools.registry import current_session_tool_scope, session_tool_scope
+    if current and scope == current_session_tool_scope() and scope is not None:
+        with session_tool_scope(None):
+            inherited = _resolve_server_key(name)
+        if inherited in _core._servers or inherited in _core._lazy_server_configs:
+            return inherited
+    return own
+
+
+def _server_policy_key(name: str) -> ServerKey:
+    """Keep an inherited call's trust/cost policy on its consuming profile, not its adopter owner."""
+    own = _server_key(name)
+    resolved = _resolve_server_key(name)
+    if resolved == own:
+        return own
+    from tools.registry import current_session_tool_scope, session_tool_scope
+    scope = current_session_tool_scope()
+    if scope is not None and not _key_visible_in_scope(resolved, scope):
+        # Explicit session adoption keeps session policy; inherited calls keep profile policy.
+        with session_tool_scope(None):
+            return _server_key(name)
     return own
 
 

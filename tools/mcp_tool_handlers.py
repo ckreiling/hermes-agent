@@ -126,10 +126,10 @@ def _trust_gate_check(server_name: str, tool_name: str, booked: Optional[list] =
     limit on any server. None to proceed, else a ``tool_error``. Fail-closed: approval-system errors
     block. An admitted costed call is charged to the chat's tally and appended to *booked* so the
     caller can refund it when the call never reaches the server."""
-    from tools.mcp_tool_scope import _server_key
+    from tools.mcp_tool_scope import _server_policy_key
     from tools import mcp_tool_costs as _costs
     # Trust and costs are the calling profile's own policy (an adopter of a shared connection keeps its own).
-    key = _server_key(server_name)
+    key = _server_policy_key(server_name)
     trust = _core._server_trust_levels.get(key, _core._TRUST_FULL)
     gated = (trust == _core._TRUST_UNTRUSTED and not _tool_is_read_only(server_name, tool_name)
              and not _trust_granted(server_name, tool_name))
