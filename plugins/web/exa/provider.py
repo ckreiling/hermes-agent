@@ -40,7 +40,7 @@ def _custom_base_url() -> str:
 def _get_exa_client() -> Any:
     base_url = _custom_base_url()
     if base_url:
-        lazy_ensure("search.exa")
+        lazy_ensure("exa")
         from exa_py import Exa
         # The SDK requires a nonempty key; authenticated gateways need no vendor key.
         client = Exa(api_key=provider_env("EXA_API_KEY") or "implicit", base_url=base_url)
