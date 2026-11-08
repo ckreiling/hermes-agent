@@ -560,6 +560,12 @@ class MCPServerRunMixin:
         if self._task and not self._task.done():
             try:
                 await asyncio.wait_for(self._task, timeout=10)
+            except asyncio.CancelledError:
+                # start() may already have cancelled the transport after a connect timeout.
+                # Observing that child's cancellation is cleanup, not cancellation of this caller.
+                caller = asyncio.current_task()
+                if not self._task.cancelled() or caller is None or caller.cancelling():
+                    raise
             except TimeoutError:
                 logger.warning("MCP server '%s' shutdown timed out, cancelling task", self.name)
                 self._task.cancel()
