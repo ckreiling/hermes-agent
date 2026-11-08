@@ -623,6 +623,11 @@ def _format_structured_value(key: str, value: Any, *, indent: int = 0, max_depth
                     for child_key in ("id", "status", "type", "scope", "quality_score", "score", "path", "url"):
                         if item.get(child_key) not in _EMPTYISH:
                             lines.append(f"{pad}    - **{child_key}:** {_truncate_text(str(item[child_key]), limit=180)}")
+                    # Deferred tool_call batches name every entry. A headline
+                    # must not hide the actual nested result (or its error).
+                    for child_key in ("result", "error", "output", "data"):
+                        if item.get(child_key) not in _EMPTYISH:
+                            lines.extend(_child(child_key, item[child_key], 2))
                 else:
                     lines.append(f"{pad}  {idx}.")
                     for child_key, child_value in list(item.items())[:max_items]:

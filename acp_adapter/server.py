@@ -34,6 +34,7 @@ from acp_adapter.events import (
     make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
+from acp_adapter import modes as _modes
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
@@ -225,9 +226,11 @@ class _TurnCallbacks:
     reasoning_cb: Any = None
     step_cb: Any = None
     stream_delta_cb: Any = None
+    interim_assistant_cb: Any = None
     approval_cb: Any = None
     edit_approval_requester: Any = None
     streamed: bool = False
+    interim_text: str | None = None
     tool_call_ids: Any = None
     tool_call_meta: Any = None
     operations: Any = None
@@ -236,23 +239,19 @@ class _TurnCallbacks:
 class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
-    _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
-    _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
-    _MODE_DEFAULT = "default"
-    # mode id -> (edit approval policy, display name, description)
-    _MODES: dict[str, tuple[str, str, str]] = {
-        "default": ("ask", "Default", "Ask before edits."),
-        "accept_edits": (
-            "workspace_session",
-            "Accept Edits",
-            "Auto-allow workspace and temp-dir edits; still asks for sensitive paths.",
-        ),
-        "dont_ask": (
-            "session", "Don't Ask", "Auto-allow file edits for this session except sensitive paths."
-        ),
-    }
-    _MODE_TO_EDIT_APPROVAL_POLICY = {mode: spec[0] for mode, spec in _MODES.items()}
-    _EDIT_APPROVAL_POLICY_TO_MODE = {spec[0]: mode for mode, spec in _MODES.items()}
+    # mode id -> (edit approval policy, display name, description): ``acp_adapter/modes.py``
+    _EDIT_APPROVAL_POLICY_CONFIG_ID = _modes.EDIT_APPROVAL_POLICY_CONFIG_ID
+    _EDIT_APPROVAL_POLICY_DEFAULT = _modes.DEFAULT_EDIT_APPROVAL_POLICY
+    _MODE_DEFAULT = _modes.DEFAULT_MODE
+    _MODES = _modes.MODES
+    _MODE_TO_EDIT_APPROVAL_POLICY = _modes.MODE_TO_EDIT_APPROVAL_POLICY
+    _EDIT_APPROVAL_POLICY_TO_MODE = _modes.EDIT_APPROVAL_POLICY_TO_MODE
+
+    def __new__(cls, session_manager=None):
+        if session_manager is None:
+            from acp_adapter.gateway_server import GatewayACPAgent
+            return GatewayACPAgent()
+        return super().__new__(cls)
 
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
@@ -475,13 +474,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return
         try:
             from model_tools import get_tool_definitions
-            from agent.memory_manager import inject_memory_provider_tools
+            from agent.memory_manager_tools import inject_memory_provider_tools
 
             agent = state.agent
             agent.enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(agent, "enabled_toolsets", None),
                 mcp_server_names=[s.name for s in mcp_servers],
             )
+            from agent.delegation_backends import saved_backend
+            agent._delegation_backend = saved_backend()  # the session routes on what its delegate_task is built from
             agent.tools = get_tool_definitions(
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None), quiet_mode=True,
@@ -682,11 +683,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             state.cancel_event.set()
             try:
                 if state.agent:
-                    request_hard_interrupt(state.agent)
-                    # Background delegations are detached from the turn's fan-out; they end with the cancel.
-                    from tools.async_delegation import interrupt_for_session
-                    interrupt_for_session(parent_session_id=str(getattr(state.agent, "session_id", "") or ""),
-                                          reason="acp_cancel")
+                    request_hard_interrupt(state.agent)  # this turn only: background delegations keep running
             except Exception:
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
         logger.info("Cancelled session %s", session_id)
@@ -922,7 +919,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
-        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
+        return await self._finish_turn(
+            state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed, cbs.interim_text,
+        )
 
     def _flush_turn_tool_calls(
         self, cbs: _TurnCallbacks, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
@@ -972,11 +971,23 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             )
             message_cb = make_message_cb(conn, session_id, loop, state.message_ids)
 
-            def stream_delta_cb(text: str) -> None:
+            def stream_delta_cb(text: str | None) -> None:
                 cbs.streamed = cbs.streamed or bool(text)
                 message_cb(text)
 
             cbs.stream_delta_cb = stream_delta_cb
+
+            def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                # A completed progress message is its own reply, not part of the final.
+                # Already-streamed text only needs its message boundary closed.
+                message_cb(None)
+                if not already_streamed:
+                    message_cb(text)
+                    message_cb(None)
+                cbs.streamed = False
+                cbs.interim_text = text
+
+            cbs.interim_assistant_cb = interim_assistant_cb
             cbs.approval_cb = make_approval_callback(
                 conn.request_permission, loop, session_id, operations=cbs.operations,
             )
@@ -996,11 +1007,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         agent.thinking_callback = None
         agent.reasoning_callback, agent.step_callback = cbs.reasoning_cb, cbs.step_cb
         agent.stream_delta_callback = cbs.stream_delta_cb
+        agent.interim_assistant_callback = cbs.interim_assistant_cb
         return cbs
 
     async def _finish_turn(
         self, state: SessionState, session_id: str, conn: Any, result: dict, pre_turn_hermes_id: Any,
         streamed_message: bool,
+        interim_message: str | None = None,
     ) -> PromptResponse:
         """Persist, emit provenance/final text, drain queued prompts, report usage."""
         try:
@@ -1029,7 +1042,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             interrupted = bool(result.get("interrupted")) or cancelled
             suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
             # Send the final text unless already streamed — or if a plugin hook transformed it after.
-            if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
+            already_delivered = streamed_message or final_response == interim_message
+            if final_response and conn and not suppress and (not already_delivered or result.get("response_transformed")):
                 update = acp.update_agent_message_text(final_response)
                 if state.message_ids is not None:
                     # A plugin-rewritten reply replaces the streamed bubble (same id); an

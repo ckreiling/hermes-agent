@@ -217,7 +217,8 @@ def test_server_wires_shared_operation_identity_and_retires_it():
     from acp_adapter.session import SessionState
     client = Client()
     sent = client.updates
-    server = HermesACPAgent.__new__(HermesACPAgent)
+    # Explicit legacy-direct unit coverage; default-route proof lives in test_gateway_fork_wire.
+    server = object.__new__(HermesACPAgent)
     state = SessionState(session_id='s1', agent=SimpleNamespace(), cwd='/project')
     def worker(loop):
         callbacks = server._wire_turn_callbacks(state, 's1', client, loop)

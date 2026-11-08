@@ -71,3 +71,47 @@ def test_title_override_cannot_enable_titling_for_machine_runs(monkeypatch, plat
     _maybe_title_session_at_turn_start(agent, [], "Actual question")
 
     title.assert_not_called()
+
+
+@pytest.mark.parametrize("platform", ["acp", "ACP"])
+@pytest.mark.parametrize("db_created", [False, True])
+def test_bb_owns_acp_thread_titles_without_native_title_work(monkeypatch, platform, db_created):
+    monkeypatch.setenv("BB_THREAD_ID", "thr_title_regression")
+    agent = SimpleNamespace(
+        platform=platform, _session_db=Mock(), session_id="test",
+        _session_db_created=db_created, _ensure_db_session=Mock(), _on_session_title=Mock(),
+    )
+    title = Mock()
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", title)
+
+    _maybe_title_session_at_turn_start(
+        agent, [{"role": "user", "content": "<system_instructions>\nInjected context"}],
+        "Actual question",
+    )
+
+    title.assert_not_called()
+    agent._ensure_db_session.assert_not_called()
+    assert not agent._session_db.mock_calls
+    agent._on_session_title.assert_not_called()
+    assert not hasattr(agent, "_deferred_title_upgrade")
+
+
+@pytest.mark.parametrize("platform, bb_thread_id", [
+    ("acp", None), ("acp", ""), ("acp", "   "),
+    ("cli", "thr_parent"), ("desktop", "thr_parent"), ("telegram", "thr_parent"),
+])
+def test_bb_title_ownership_does_not_disable_other_surfaces(monkeypatch, platform, bb_thread_id):
+    if bb_thread_id is None:
+        monkeypatch.delenv("BB_THREAD_ID", raising=False)
+    else:
+        monkeypatch.setenv("BB_THREAD_ID", bb_thread_id)
+    agent = SimpleNamespace(
+        platform=platform, _session_db=Mock(), session_id="test", _session_db_created=True,
+    )
+    title = Mock()
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", title)
+
+    _maybe_title_session_at_turn_start(agent, [{"role": "user", "content": "Actual question"}])
+
+    title.assert_called_once()
+    assert title.call_args.args[2] == "Actual question"
