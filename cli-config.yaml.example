@@ -2072,6 +2072,11 @@ display:
   #   false: Silent (default)
   bell_on_prompt: false
 
+  # Ink TUI only: OSC 7501 agent status for supporting terminals (e.g. Herdr).
+  # Reports idle/working/blocked/done/error independently of the bell settings;
+  # clears the record on exit. Set false to disable (also applies live).
+  program_status: true
+
   # Show model reasoning/thinking before each response.
   # When enabled, a dim box shows the model's thought process above the response.
   # Toggle at runtime with /reasoning show or /reasoning hide.
