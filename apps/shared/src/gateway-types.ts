@@ -151,6 +151,8 @@ export interface ConfigDisplayConfig {
   /** UI language id (`en`, `pl`, `pt-br`); the TUI fetches its pack via `i18n.catalog`. */
   language?: string
   mouse_tracking?: boolean | null | number | string
+  /** Ink TUI: OSC 7501 terminal agent status (default true). */
+  program_status?: boolean
   sections?: Record<string, string>
   show_cost?: boolean
   show_reasoning?: boolean
