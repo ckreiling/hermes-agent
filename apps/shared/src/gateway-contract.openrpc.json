@@ -9734,6 +9734,16 @@
             "title": "Omit Messages",
             "type": "boolean"
           },
+          "include_archived": {
+            "default": true,
+            "title": "Include Archived",
+            "type": "boolean"
+          },
+          "include_inventory": {
+            "default": true,
+            "title": "Include Inventory",
+            "type": "boolean"
+          },
           "cols": {
             "anyOf": [
               {

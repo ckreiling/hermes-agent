@@ -327,7 +327,7 @@ def _merge_live_in_stored_order(display, live):
     return rows + pending
 
 
-def local_history(authority, ref, prepared=None):
+def local_history(authority, ref, prepared=None, *, include_archived=True):
     """Display history of logical *ref*: every stored row the user saw, in display order.
 
     A row outside the current physical transcript's active set (summarized away by a compression)
@@ -345,6 +345,11 @@ def local_history(authority, ref, prepared=None):
     """
     db = authority.db
     target = transcript_target(authority, ref)
+    if not include_archived:
+        # Read the current live tip under attach's event-stream lock, just like the
+        # full path's final read. Do not walk/serialize archives the viewer discards.
+        return [{**{k: v for k, v in row.items() if k != '_row_id'}, 'row_id': row['_row_id']}
+                for row in db.get_messages_as_conversation(target, include_row_ids=True)]
     read_live, display, truncated = (prepared[1] if prepared is not None and prepared[0] == target
                                      else display_rows(db, target))
     live = db.get_messages_as_conversation(target, include_row_ids=True)

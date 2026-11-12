@@ -5178,6 +5178,8 @@ export interface CanonicalResumeParams {
   api_key?: string | null
   defer_history?: boolean
   omit_messages?: boolean
+  include_archived?: boolean
+  include_inventory?: boolean
   cols?: number | null
   display_projection?: boolean
 }

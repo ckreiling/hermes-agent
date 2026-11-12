@@ -68,6 +68,10 @@ class CanonicalResumeParams(ProfileParams):
     api_key: str | None = None
     defer_history: bool = False
     omit_messages: bool = False
+    # Lightweight viewers can skip the archived lineage and unused banner probes.
+    # Defaults preserve the full CLI/TUI/ACP snapshot.
+    include_archived: bool = True
+    include_inventory: bool = True
     cols: int | None = None
     # A renderer (the Ink TUI) asks for main's display projection of the same rows
     # (``tui_gateway.session_history._history_to_messages``) as ``display_messages``.

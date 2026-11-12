@@ -353,7 +353,7 @@ class SessionAuthority:
                 raise RuntimeStoreError('not_found') from None
             raise
 
-    async def attach(self, actor, ref, *, history=True, replay_from=None):
+    async def attach(self, actor, ref, *, history=True, replay_from=None, include_archived=True):
         """Join *ref*'s event stream and snapshot it. ``history=False``: the snapshot carries no transcript
         (``history == ()``), only the physical ``transcript_target``, so the display-row lineage read is
         skipped; for a viewer that pages the transcript itself (Desktop over REST).
@@ -361,7 +361,7 @@ class SessionAuthority:
         self.authorize(actor, ref, 'session:read')
         from gateway.session_local_recovery import local_history, prepare_history, transcript_target
         # The lineage read stays off the loop and the lock; without history the target is resolved under it.
-        prepared = await prepare_history(self, ref) if history else None
+        prepared = await prepare_history(self, ref) if history and include_archived else None
         from gateway.session_onboarding import keep_from_discard
         # The last await before the viewer joins: a fresh launch's claim is taken back with no yield
         # before the join, and a delete already past it answers not_found below.
@@ -390,7 +390,10 @@ class SessionAuthority:
             prompts = live.controls.snapshot(ref.session_id, active_generation)
             epoch, sequence = live.event_stream.watermark()
             if history:
-                history, target = self.unless_deleted(ref, lambda: tuple(local_history(self, ref, prepared))), None
+                history, target = self.unless_deleted(ref, lambda: tuple(local_history(
+                    self, ref, prepared, **({'include_archived': False} if not include_archived else {})))), None
+                if not include_archived:
+                    target = self.unless_deleted(ref, lambda: transcript_target(self, ref))
             else:
                 history, target = (), self.unless_deleted(ref, lambda: transcript_target(self, ref))
             snapshot = SubscriptionSnapshot(subscription, handle, epoch, sequence, history,

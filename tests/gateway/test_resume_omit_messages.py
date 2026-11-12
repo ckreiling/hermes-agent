@@ -77,6 +77,47 @@ async def test_omit_messages_resume_reads_no_transcript(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lean_resume_skips_archive_and_inventory_without_changing_live_state(tmp_path, monkeypatch):
+    from gateway import session_local_recovery, session_local_inventory, session_local
+    from gateway.session_controls import AuthorityConnection
+    authority, actor, ref, physical = await _local_session(tmp_path, monkeypatch)
+    _seed_compacted(authority.db, physical)
+    full = await _resume(authority, actor, ref)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError('lean resume performed an archive or inventory read')
+
+    monkeypatch.setattr(session_local_recovery, 'display_rows', forbidden)
+    monkeypatch.setattr(session_local_inventory, 'session_inventory', forbidden)
+    monkeypatch.setattr(session_local, 'local_session_info', lambda *a: {
+        'desktop_protocol': 'hermes-gateway-v1', 'model': 'frozen', 'reasoning_effort': 'high'})
+    conn = AuthorityConnection(authority, object(), {'user_id': 'owner'})
+    conn.actor = actor
+    authority.events[actor.transport_id] = object()
+    reply = await conn.dispatch({'jsonrpc': '2.0', 'id': 1, 'method': 'session.resume', 'params': {
+        'session_id': ref.session_id, 'include_archived': False, 'include_inventory': False}})
+    assert 'error' not in reply, reply
+    lean = reply['result']
+    assert lean['messages'] == [row for row in full['messages'] if not row.get('archived')]
+    assert lean['message_count'] == len(lean['messages'])
+    assert lean['todo_state'] == full['todo_state']
+    for key in ('session_id', 'stored_session_id', 'execution_generation', 'pending', 'prompts', 'running'):
+        assert lean[key] == full[key]
+    assert lean['info'] == {'desktop_protocol': 'hermes-gateway-v1', 'model': 'frozen', 'reasoning_effort': 'high'}
+    assert 'lean-resume-v1' in (await conn.describe(ref, {}))['capabilities']
+
+
+@pytest.mark.asyncio
+async def test_lean_resume_is_still_authorized(tmp_path, monkeypatch):
+    from gateway.session_controls import AuthorityConnection
+    authority, _actor, ref, _ = await _local_session(tmp_path, monkeypatch)
+    stranger = AuthorityConnection(authority, object(), {'user_id': 'stranger'})
+    reply = await stranger.dispatch({'jsonrpc': '2.0', 'id': 1, 'method': 'session.resume', 'params': {
+        'session_id': ref.session_id, 'include_archived': False, 'include_inventory': False}})
+    assert reply['error']['data']['reason'] in {'permission_denied', 'not_found'}
+
+
+@pytest.mark.asyncio
 async def test_omitted_resume_keeps_an_undone_plan_gone_after_a_rotated_compression(tmp_path, monkeypatch):
     """The rewind removes the child's copy of the Todo turn; the parent's copy must not restore its plan."""
     from gateway.session_mutations import mutate_session
@@ -107,6 +148,8 @@ async def test_omitted_resume_keeps_an_undone_plan_gone_after_a_rotated_compress
     assert full['todo_state'] is None
     omitted = await _resume(authority, actor, ref, omit_messages=True)
     assert omitted['todo_state'] == full['todo_state']
+    lean = await _resume(authority, actor, ref, include_archived=False, include_inventory=False)
+    assert lean['todo_state'] is None
 
 
 @pytest.mark.asyncio
@@ -127,7 +170,8 @@ async def test_omitted_resume_reply_passes_the_wire_contract(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_omitted_resume_racing_a_delete_answers_not_found(tmp_path, monkeypatch):
+@pytest.mark.parametrize('params', [{'omit_messages': True}, {'include_archived': False, 'include_inventory': False}])
+async def test_omitted_resume_racing_a_delete_answers_not_found(tmp_path, monkeypatch, params):
     """A delete committing after the attach, before the omitted reply's count/plan read, is ``not_found``."""
     from gateway.session_controls import AuthorityConnection
     authority, actor, ref, physical = await _local_session(tmp_path, monkeypatch)
@@ -144,5 +188,5 @@ async def test_omitted_resume_racing_a_delete_answers_not_found(tmp_path, monkey
     conn.actor = actor
     authority.events[actor.transport_id] = object()
     reply = await conn.dispatch({'jsonrpc': '2.0', 'id': 1, 'method': 'session.resume',
-                                 'params': {'session_id': ref.session_id, 'omit_messages': True}})
+                                 'params': {'session_id': ref.session_id, **params}})
     assert reply['error']['data']['reason'] == 'not_found', reply

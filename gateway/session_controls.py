@@ -118,13 +118,13 @@ def model_only(row):
     return isinstance(metadata, dict) and bool(metadata.get(MODEL_ONLY_DISPLAY_METADATA_KEY))
 
 
-async def _resume_transcript(authority, ref, snapshot, history, omit):
+async def _resume_transcript(authority, ref, snapshot, history, omit, *, live_only=False):
     """A resume reply's transcript fields. *omit* (``omit_messages``): no rows and ``messages_omitted``, the
     stored count and the todo plan of the physical target the attach resolved, as the stdio resume answers
     it; the display-row lineage read is skipped (the todo lookup still walks the lineage's todo rows)."""
     # Its home module, not tui_gateway.server: importing the stdio sidecar points sys.stdout at stderr.
     from tui_gateway.tool_progress import _todo_state_from_history
-    if not omit:
+    if not omit and not live_only:
         # The newest todo result in the transcript, the snapshot the session's agent hydrates
         # from and its ``todo.updated`` frames carried: a viewer attaching shows the plan now.
         return {'messages': history, 'message_count': len(history), 'todo_state': _todo_state_from_history(history)}
@@ -132,6 +132,8 @@ async def _resume_transcript(authority, ref, snapshot, history, omit):
     # A delete committed since the attach is ``not_found``, as one during the attach is.
     todo_state, count = await asyncio.to_thread(authority.unless_deleted, ref, partial(
         omitted_history_state, authority.db, snapshot.transcript_target))
+    if not omit:
+        return {'messages': history, 'message_count': len(history), 'todo_state': todo_state}
     return {'messages': [], 'messages_omitted': True, 'message_count': count, 'todo_state': todo_state}
 
 
@@ -551,7 +553,7 @@ class AuthorityConnection:
         return {'instance_id': self.authority.instance_id, 'profile_id': self.authority.profile_id,
                 'authority_epoch': self.authority.epoch,
                 'capabilities': ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', 'acp-editor-policy-v1',
-                                 'acp-session-mcp-v1', 'clarify-batch-v1',
+                                 'acp-session-mcp-v1', 'clarify-batch-v1', 'lean-resume-v1',
                                  *(['acp-client-env-v1'] if self.native_owner else [])],
                 'session_create': {'sources': sorted(SURFACES),
                                    'parameters': sorted(CREATE_FIELDS | {'title'})},
@@ -677,7 +679,8 @@ class AuthorityConnection:
         # compression lineage (a whole-lineage read here made every open of a long chat cost seconds).
         omit = params.get('omit_messages') is True
         snapshot = await self.authority.attach(
-            self.actor, ref, history=not omit, replay_from=replay_from if ref.session_id == requested else None)
+            self.actor, ref, history=not omit, replay_from=replay_from if ref.session_id == requested else None,
+            **({'include_archived': False} if params.get('include_archived') is False else {}))
         self.subscriptions[ref.session_id] = snapshot.subscription_id
         self.handed_back.discard(ref.session_id)
         self._spawn_notice(ref)
@@ -688,7 +691,11 @@ class AuthorityConnection:
         if source is not None and source.platform == Platform.LOCAL:
             from gateway.session_policy import policy_for_source, refresh_profile_hooks
             await asyncio.to_thread(refresh_profile_hooks, policy_for_source(self.authority.runner, source))
-            info = await snapshot_info(self.authority, snapshot.handle.ref)
+            if params.get('include_inventory') is False:
+                from gateway.session_local import local_session_info
+                info = local_session_info(self.authority, snapshot.handle.ref)
+            else:
+                info = await snapshot_info(self.authority, snapshot.handle.ref)
         from gateway.session_connections import pending_connection
         from gateway.session_server_requests import open_requests
         history, display = list(snapshot.history), {}
@@ -697,7 +704,8 @@ class AuthorityConnection:
             display['display_messages'] = display_projection(
                 [row for row in history if not model_only(row)], self.authority.profile_id)
         return {'session_id': ref.session_id, 'stored_session_id': ref.session_id,
-                **await _resume_transcript(self.authority, ref, snapshot, history, omit), **display,
+                **await _resume_transcript(self.authority, ref, snapshot, history, omit,
+                                          live_only=params.get('include_archived') is False), **display,
                 'running': snapshot.handle.execution_state == 'running',
                 'authority_epoch': snapshot.handle.authority_epoch,
                 'replay_epoch': snapshot.replay_epoch, 'last_sequence': snapshot.last_sequence,
